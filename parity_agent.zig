@@ -3,15 +3,15 @@ const posix = std.posix;
 
 const PROTOCOL = "parity-json-v1";
 const CAPABILITIES = [_][]const u8{
-    "get_scalars",
-    "call_add",
-    "nested_object_access",
-    "construct_greeter",
-    "callback_roundtrip",
-    "object_argument_roundtrip",
-    "error_propagation",
-    "shared_reference_consistency",
-    "explicit_release",
+    "GetScalars",
+    "CallAdd",
+    "NestedObjectAccess",
+    "ConstructGreeter",
+    "CallbackRoundtrip",
+    "ObjectArgumentRoundtrip",
+    "ErrorPropagation",
+    "SharedReferenceConsistency",
+    "ExplicitRelease",
 };
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -49,39 +49,28 @@ const Fixture = struct {
     }
 
     fn scenarioResult(self: *Fixture, scenario: []const u8, allocator: std.mem.Allocator) !ScenarioResult {
-        if (std.mem.eql(u8, scenario, "get_scalars")) {
-            return .{ .value = "{"
-                ++ "\"intValue\":42,"
-                ++ "\"boolValue\":true,"
-                ++ "\"stringValue\":\"hello\","
-                ++ "\"nullValue\":null"
-                ++ "}" };
+        const canonical = canonicalScenario(scenario) orelse return error.UnsupportedScenario;
+
+        if (std.mem.eql(u8, canonical, "GetScalars")) {
+            return .{ .value = "{" ++ "\"intValue\":42," ++ "\"boolValue\":true," ++ "\"stringValue\":\"hello\"," ++ "\"nullValue\":null" ++ "}" };
         }
-        if (std.mem.eql(u8, scenario, "call_add")) return .{ .value = "42" };
-        if (std.mem.eql(u8, scenario, "nested_object_access")) {
+        if (std.mem.eql(u8, canonical, "CallAdd")) return .{ .value = "42" };
+        if (std.mem.eql(u8, canonical, "NestedObjectAccess")) {
             return .{
-                .value = "{"
-                    ++ "\"label\":\"nested\","
-                    ++ "\"pong\":\"pong\""
-                    ++ "}",
+                .value = "{" ++ "\"label\":\"nested\"," ++ "\"pong\":\"pong\"" ++ "}",
             };
         }
-        if (std.mem.eql(u8, scenario, "construct_greeter")) return .{ .value = "\"Hello World\"" };
-        if (std.mem.eql(u8, scenario, "callback_roundtrip")) return .{ .value = "\"callback:value\"" };
-        if (std.mem.eql(u8, scenario, "object_argument_roundtrip")) return .{ .value = "\"helper:Ada\"" };
-        if (std.mem.eql(u8, scenario, "error_propagation")) return .{ .value = "\"Boom\"" };
-        if (std.mem.eql(u8, scenario, "shared_reference_consistency")) {
+        if (std.mem.eql(u8, canonical, "ConstructGreeter")) return .{ .value = "\"Hello World\"" };
+        if (std.mem.eql(u8, canonical, "CallbackRoundtrip")) return .{ .value = "\"callback:value\"" };
+        if (std.mem.eql(u8, canonical, "ObjectArgumentRoundtrip")) return .{ .value = "\"helper:Ada\"" };
+        if (std.mem.eql(u8, canonical, "ErrorPropagation")) return .{ .value = "\"Boom\"" };
+        if (std.mem.eql(u8, canonical, "SharedReferenceConsistency")) {
             return .{
-                .value = "{"
-                    ++ "\"firstKind\":\"shared\","
-                    ++ "\"secondKind\":\"shared\","
-                    ++ "\"firstValue\":\"shared\","
-                    ++ "\"secondValue\":\"shared\""
-                    ++ "}",
+                .value = "{" ++ "\"firstKind\":\"shared\"," ++ "\"secondKind\":\"shared\"," ++ "\"firstValue\":\"shared\"," ++ "\"secondValue\":\"shared\"" ++ "}",
             };
         }
 
-        if (std.mem.eql(u8, scenario, "explicit_release")) {
+        if (std.mem.eql(u8, canonical, "ExplicitRelease")) {
             const before = self.debugStats().before;
             self.acquireShared();
             self.acquireShared();
@@ -129,12 +118,54 @@ fn emitScenario(stream: std.net.Stream, scenario: []const u8, status: []const u8
 }
 
 fn hasCapability(name: []const u8) bool {
+    const canonical = canonicalScenario(name) orelse return false;
     for (CAPABILITIES) |capability| {
-        if (std.mem.eql(u8, name, capability)) {
+        if (std.mem.eql(u8, canonical, capability)) {
             return true;
         }
     }
     return false;
+}
+
+fn canonicalScenario(name: []const u8) ?[]const u8 {
+    const normalized = normalizeScenarioName(name);
+    for (CAPABILITIES) |capability| {
+        if (std.mem.eql(u8, normalized, capability)) {
+            return capability;
+        }
+    }
+    return null;
+}
+
+fn normalizeScenarioName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "GetScalars") or std.mem.eql(u8, name, "get_scalars") or std.mem.eql(u8, name, "get-scalars") or std.mem.eql(u8, name, "getScalars")) {
+        return "GetScalars";
+    }
+    if (std.mem.eql(u8, name, "CallAdd") or std.mem.eql(u8, name, "call_add") or std.mem.eql(u8, name, "call-add") or std.mem.eql(u8, name, "callAdd")) {
+        return "CallAdd";
+    }
+    if (std.mem.eql(u8, name, "NestedObjectAccess") or std.mem.eql(u8, name, "nested_object_access") or std.mem.eql(u8, name, "nested-object-access") or std.mem.eql(u8, name, "nestedObjectAccess")) {
+        return "NestedObjectAccess";
+    }
+    if (std.mem.eql(u8, name, "ConstructGreeter") or std.mem.eql(u8, name, "construct_greeter") or std.mem.eql(u8, name, "construct-greeter") or std.mem.eql(u8, name, "constructGreeter")) {
+        return "ConstructGreeter";
+    }
+    if (std.mem.eql(u8, name, "CallbackRoundtrip") or std.mem.eql(u8, name, "callback_roundtrip") or std.mem.eql(u8, name, "callback-roundtrip") or std.mem.eql(u8, name, "callbackRoundtrip")) {
+        return "CallbackRoundtrip";
+    }
+    if (std.mem.eql(u8, name, "ObjectArgumentRoundtrip") or std.mem.eql(u8, name, "object_argument_roundtrip") or std.mem.eql(u8, name, "object-argument-roundtrip") or std.mem.eql(u8, name, "objectArgumentRoundtrip")) {
+        return "ObjectArgumentRoundtrip";
+    }
+    if (std.mem.eql(u8, name, "ErrorPropagation") or std.mem.eql(u8, name, "error_propagation") or std.mem.eql(u8, name, "error-propagation") or std.mem.eql(u8, name, "errorPropagation")) {
+        return "ErrorPropagation";
+    }
+    if (std.mem.eql(u8, name, "SharedReferenceConsistency") or std.mem.eql(u8, name, "shared_reference_consistency") or std.mem.eql(u8, name, "shared-reference-consistency") or std.mem.eql(u8, name, "sharedReferenceConsistency")) {
+        return "SharedReferenceConsistency";
+    }
+    if (std.mem.eql(u8, name, "ExplicitRelease") or std.mem.eql(u8, name, "explicit_release") or std.mem.eql(u8, name, "explicit-release") or std.mem.eql(u8, name, "explicitRelease")) {
+        return "ExplicitRelease";
+    }
+    return name;
 }
 
 fn parseScenarios(raw: []const u8, allocator: std.mem.Allocator) !std.array_list.Managed([]const u8) {
@@ -145,7 +176,8 @@ fn parseScenarios(raw: []const u8, allocator: std.mem.Allocator) !std.array_list
         if (trimmed.len == 0) {
             continue;
         }
-        try scenarios.append(trimmed);
+        const canonical = canonicalScenario(trimmed) orelse trimmed;
+        try scenarios.append(canonical);
     }
     return scenarios;
 }
@@ -201,22 +233,23 @@ fn serve() !void {
         }
 
         for (requested.items) |scenario| {
+            const canonical = canonicalScenario(scenario) orelse scenario;
             if (!hasCapability(scenario)) {
-                try emitScenario(connection.stream, scenario, "unsupported", null, "unsupported");
+                try emitScenario(connection.stream, canonical, "unsupported", null, "unsupported");
                 continue;
             }
 
-            const outcome = fixture.scenarioResult(scenario, std.heap.page_allocator) catch |err| switch (err) {
+            const outcome = fixture.scenarioResult(canonical, std.heap.page_allocator) catch |err| switch (err) {
                 error.UnsupportedScenario => {
-                    try emitScenario(connection.stream, scenario, "unsupported", null, "unsupported");
+                    try emitScenario(connection.stream, canonical, "unsupported", null, "unsupported");
                     continue;
                 },
                 else => {
-                    try emitScenario(connection.stream, scenario, "failed", null, "server error");
+                    try emitScenario(connection.stream, canonical, "failed", null, "server error");
                     continue;
                 },
             };
-            try emitScenario(connection.stream, scenario, "passed", outcome.value, null);
+            try emitScenario(connection.stream, canonical, "passed", outcome.value, null);
             if (outcome.owned) {
                 std.heap.page_allocator.free(outcome.value);
             }
