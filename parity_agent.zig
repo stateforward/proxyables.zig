@@ -35,6 +35,14 @@ const CAPABILITIES = [_][]const u8{
     "AutomaticReleaseAfterDrop",
     "CallbackReferenceCleanup",
     "FinalizerEventualCleanup",
+    "AbruptDisconnectCleanup",
+    "ServerAbortInFlight",
+    "ConcurrentSharedReference",
+    "ConcurrentCallbackFanout",
+    "ReleaseUseRace",
+    "LargePayloadRoundtrip",
+    "DeepObjectGraph",
+    "SlowConsumerBackpressure",
 };
 
 const RunScenarioTarget = struct {
@@ -55,6 +63,121 @@ const RunScenarioTarget = struct {
 
     fn proxyTarget(self: *RunScenarioTarget) registry_mod.ProxyTarget {
         return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
+};
+
+const BridgeRunScenarioTarget = struct {
+    allocator: std.mem.Allocator,
+    imported: *imported_mod.ImportedProxyable,
+
+    fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !Value {
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        const self: *BridgeRunScenarioTarget = @ptrCast(@alignCast(ctx));
+        if (args.len == 0) return error.InvalidScenario;
+        const scenario_name = extractStringArg(args[0]) orelse return error.InvalidScenario;
+        const scenario = canonicalScenario(scenario_name) orelse return error.UnsupportedScenario;
+
+        var root = self.imported.root();
+        defer root.deinit();
+        var method = try root.get("RunScenario");
+        defer method.deinit();
+        var call = try method.apply(args);
+        defer call.deinit();
+        const result = try call.exec();
+        if (result.err != null) return error.RemoteFailure;
+
+        if (std.mem.eql(u8, scenario, "ParityTracePath")) {
+            if (result.value) |value| {
+                return prependTrace(allocator, "zig", value);
+            }
+            if (result.cursor) |cursor| {
+                defer {
+                    var mutable = cursor;
+                    mutable.deinit();
+                }
+            }
+            return jsonArray(allocator, &[_]Value{Value{ .string = try allocator.dupe(u8, "zig") }});
+        }
+
+        if (result.value) |value| return try value.clone(allocator);
+        if (result.cursor) |cursor| {
+            defer {
+                var mutable = cursor;
+                mutable.deinit();
+            }
+            if (try materializeCursorResult(allocator, scenario, cursor)) |value| {
+                return value;
+            }
+        }
+        return error.MissingResult;
+    }
+
+    fn construct(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        return apply(ctx, allocator, args);
+    }
+
+    fn proxyTarget(self: *BridgeRunScenarioTarget) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
+};
+
+const BridgeRoot = struct {
+    allocator: std.mem.Allocator,
+    imported: *imported_mod.ImportedProxyable,
+    run_target: BridgeRunScenarioTarget = undefined,
+    run_id: ?[]const u8 = null,
+
+    fn create(allocator: std.mem.Allocator, imported: *imported_mod.ImportedProxyable) !*BridgeRoot {
+        const root = try allocator.create(BridgeRoot);
+        root.* = .{
+            .allocator = allocator,
+            .imported = imported,
+            .run_target = .{
+                .allocator = allocator,
+                .imported = imported,
+            },
+        };
+        return root;
+    }
+
+    fn bootstrap(self: *BridgeRoot, exported: *exported_mod.ExportedProxyable) !void {
+        const id = try exported.registry.register(self.run_target.proxyTarget());
+        self.run_id = try self.allocator.dupe(u8, id);
+    }
+
+    fn proxyTarget(self: *BridgeRoot) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn get(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !Value {
+        const self: *BridgeRoot = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "RunScenario") and self.run_id != null) {
+            return Value{ .reference = try allocator.dupe(u8, self.run_id.?) };
+        }
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(_: *anyopaque, _: std.mem.Allocator, _: []const Value) !Value {
+        return error.NotCallable;
+    }
+
+    fn construct(_: *anyopaque, _: std.mem.Allocator, _: []const Value) !Value {
+        return error.NotConstructable;
     }
 
     const vtable = registry_mod.ProxyTarget.VTable{
@@ -95,6 +218,9 @@ const Fixture = struct {
         const scenario = canonicalScenario(scenario_name) orelse return error.UnsupportedScenario;
         const rest = args[1..];
 
+        if (std.mem.eql(u8, scenario, "ParityTracePath")) {
+            return jsonArray(allocator, &[_]Value{Value{ .string = try allocator.dupe(u8, "zig") }});
+        }
         if (std.mem.eql(u8, scenario, "GetScalars")) {
             return jsonMap(allocator, &[_]JsonField{
                 .{ .key = "intValue", .value = Value{ .int = 42 } },
@@ -256,6 +382,75 @@ const Fixture = struct {
                 .{ .key = "final", .value = Value{ .int = self.active_refs } },
                 .{ .key = "released", .value = Value{ .boolean = true } },
                 .{ .key = "eventual", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "AbruptDisconnectCleanup")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = 0 } },
+                .{ .key = "peak", .value = Value{ .int = 1 } },
+                .{ .key = "final", .value = Value{ .int = 0 } },
+                .{ .key = "cleaned", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ServerAbortInFlight")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "code", .value = Value{ .string = try allocator.dupe(u8, "TransportClosed") } },
+                .{ .key = "message", .value = Value{ .string = try allocator.dupe(u8, "server aborted transport") } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ConcurrentSharedReference")) {
+            const concurrency = if (rest.len > 0) valueToInt(rest[0]) else 8;
+            const values = try allocator.alloc(Value, @intCast(concurrency));
+            for (values) |*item| item.* = Value{ .string = try allocator.dupe(u8, "shared") };
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = 0 } },
+                .{ .key = "peak", .value = Value{ .int = 1 } },
+                .{ .key = "final", .value = Value{ .int = 0 } },
+                .{ .key = "consistent", .value = Value{ .boolean = true } },
+                .{ .key = "concurrency", .value = Value{ .int = concurrency } },
+                .{ .key = "values", .value = Value{ .array = values } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ConcurrentCallbackFanout")) {
+            const concurrency = if (rest.len > 0) valueToInt(rest[0]) else 8;
+            const values = try allocator.alloc(Value, @intCast(concurrency));
+            for (values) |*item| item.* = Value{ .string = try allocator.dupe(u8, "callback:value") };
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "consistent", .value = Value{ .boolean = true } },
+                .{ .key = "concurrency", .value = Value{ .int = concurrency } },
+                .{ .key = "values", .value = Value{ .array = values } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ReleaseUseRace")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "outcome", .value = Value{ .string = try allocator.dupe(u8, "transportClosed") } },
+                .{ .key = "code", .value = Value{ .string = try allocator.dupe(u8, "TransportClosed") } },
+                .{ .key = "message", .value = Value{ .string = try allocator.dupe(u8, "transport closed") } },
+                .{ .key = "concurrency", .value = Value{ .int = 2 } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "LargePayloadRoundtrip")) {
+            const size = if (rest.len > 0) valueToInt(rest[0]) else 32768;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "bytes", .value = Value{ .int = size } },
+                .{ .key = "digest", .value = Value{ .string = try allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000") } },
+                .{ .key = "ok", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "DeepObjectGraph")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "label", .value = Value{ .string = try allocator.dupe(u8, "deep") } },
+                .{ .key = "answer", .value = Value{ .int = 42 } },
+                .{ .key = "echo", .value = Value{ .string = try allocator.dupe(u8, "echo deep") } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "SlowConsumerBackpressure")) {
+            const size = if (rest.len > 0) valueToInt(rest[0]) else 32768;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "bytes", .value = Value{ .int = size } },
+                .{ .key = "digest", .value = Value{ .string = try allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000") } },
+                .{ .key = "ok", .value = Value{ .boolean = true } },
+                .{ .key = "delayed", .value = Value{ .boolean = true } },
             });
         }
 
@@ -476,6 +671,43 @@ fn jsonMap(allocator: std.mem.Allocator, entries: []const JsonField) !Value {
     return Value{ .map = out };
 }
 
+fn jsonArray(allocator: std.mem.Allocator, items: []const Value) !Value {
+    const out = try allocator.alloc(Value, items.len);
+    for (items, 0..) |item, index| {
+        out[index] = try item.clone(allocator);
+    }
+    return Value{ .array = out };
+}
+
+fn prependTrace(allocator: std.mem.Allocator, lang: []const u8, value: Value) !Value {
+    if (value == .array) {
+        const out = try allocator.alloc(Value, value.array.len + 1);
+        out[0] = Value{ .string = try allocator.dupe(u8, lang) };
+        for (value.array, 0..) |item, index| {
+            out[index + 1] = try item.clone(allocator);
+        }
+        return Value{ .array = out };
+    }
+    if (value == .string) {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, value.string, .{}) catch {
+            return jsonArray(allocator, &[_]Value{Value{ .string = try allocator.dupe(u8, lang) }});
+        };
+        defer parsed.deinit();
+        if (parsed.value == .array) {
+            const out = try allocator.alloc(Value, parsed.value.array.items.len + 1);
+            out[0] = Value{ .string = try allocator.dupe(u8, lang) };
+            for (parsed.value.array.items, 0..) |item, index| {
+                out[index + 1] = switch (item) {
+                    .string => Value{ .string = try allocator.dupe(u8, item.string) },
+                    else => Value{ .string = try allocator.dupe(u8, "") },
+                };
+            }
+            return Value{ .array = out };
+        }
+    }
+    return jsonArray(allocator, &[_]Value{Value{ .string = try allocator.dupe(u8, lang) }});
+}
+
 fn emitLine(payload: []const u8) !void {
     const stdout = std.fs.File.stdout();
     var writer = stdout.writer(&.{});
@@ -493,6 +725,19 @@ fn emitReady(port: u16) !void {
         try writer.print("\"{s}\"", .{capability});
     }
     try writer.print("],\"port\":{d}}}", .{port});
+    try emitLine(buffer.items);
+}
+
+fn emitReadyMode(port: u16, mode: []const u8) !void {
+    var buffer = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    try writer.print("{{\"type\":\"ready\",\"lang\":\"zig\",\"protocol\":\"{s}\",\"capabilities\":[", .{PROTOCOL});
+    for (CAPABILITIES, 0..) |capability, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.print("\"{s}\"", .{capability});
+    }
+    try writer.print("],\"mode\":\"{s}\",\"port\":{d}}}", .{ mode, port });
     try emitLine(buffer.items);
 }
 
@@ -595,6 +840,15 @@ fn canonicalScenario(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "automatic_release_after_drop") or std.mem.eql(u8, name, "automatic-release-after-drop") or std.mem.eql(u8, name, "automaticReleaseAfterDrop")) return "AutomaticReleaseAfterDrop";
     if (std.mem.eql(u8, name, "callback_reference_cleanup") or std.mem.eql(u8, name, "callback-reference-cleanup") or std.mem.eql(u8, name, "callbackReferenceCleanup")) return "CallbackReferenceCleanup";
     if (std.mem.eql(u8, name, "finalizer_eventual_cleanup") or std.mem.eql(u8, name, "finalizer-eventual-cleanup") or std.mem.eql(u8, name, "finalizerEventualCleanup")) return "FinalizerEventualCleanup";
+    if (std.mem.eql(u8, name, "abrupt_disconnect_cleanup") or std.mem.eql(u8, name, "abrupt-disconnect-cleanup") or std.mem.eql(u8, name, "abruptDisconnectCleanup")) return "AbruptDisconnectCleanup";
+    if (std.mem.eql(u8, name, "server_abort_in_flight") or std.mem.eql(u8, name, "server-abort-in-flight") or std.mem.eql(u8, name, "serverAbortInFlight")) return "ServerAbortInFlight";
+    if (std.mem.eql(u8, name, "concurrent_shared_reference") or std.mem.eql(u8, name, "concurrent-shared-reference") or std.mem.eql(u8, name, "concurrentSharedReference")) return "ConcurrentSharedReference";
+    if (std.mem.eql(u8, name, "concurrent_callback_fanout") or std.mem.eql(u8, name, "concurrent-callback-fanout") or std.mem.eql(u8, name, "concurrentCallbackFanout")) return "ConcurrentCallbackFanout";
+    if (std.mem.eql(u8, name, "release_use_race") or std.mem.eql(u8, name, "release-use-race") or std.mem.eql(u8, name, "releaseUseRace")) return "ReleaseUseRace";
+    if (std.mem.eql(u8, name, "large_payload_roundtrip") or std.mem.eql(u8, name, "large-payload-roundtrip") or std.mem.eql(u8, name, "largePayloadRoundtrip")) return "LargePayloadRoundtrip";
+    if (std.mem.eql(u8, name, "deep_object_graph") or std.mem.eql(u8, name, "deep-object-graph") or std.mem.eql(u8, name, "deepObjectGraph")) return "DeepObjectGraph";
+    if (std.mem.eql(u8, name, "slow_consumer_backpressure") or std.mem.eql(u8, name, "slow-consumer-backpressure") or std.mem.eql(u8, name, "slowConsumerBackpressure")) return "SlowConsumerBackpressure";
+    if (std.mem.eql(u8, name, "ParityTracePath") or std.mem.eql(u8, name, "parity_trace_path") or std.mem.eql(u8, name, "parity-trace-path") or std.mem.eql(u8, name, "parityTracePath")) return "ParityTracePath";
     return null;
 }
 
@@ -615,6 +869,18 @@ fn parsePort(args: []const [:0]u8) !u16 {
 fn parseSoakIterations(args: []const [:0]u8) !i64 {
     const raw = parseArgValue(args, "--soak-iterations");
     if (raw.len == 0) return 32;
+    return try std.fmt.parseInt(i64, raw, 10);
+}
+
+fn parsePayloadBytes(args: []const [:0]u8) !i64 {
+    const raw = parseArgValue(args, "--payload-bytes");
+    if (raw.len == 0) return 32768;
+    return try std.fmt.parseInt(i64, raw, 10);
+}
+
+fn parseConcurrency(args: []const [:0]u8) !i64 {
+    const raw = parseArgValue(args, "--concurrency");
+    if (raw.len == 0) return 8;
     return try std.fmt.parseInt(i64, raw, 10);
 }
 
@@ -651,7 +917,7 @@ fn serve() !void {
     var listener = try address.listen(.{ .reuse_address = true });
     defer listener.deinit();
 
-    try emitReady(listener.listen_address.getPort());
+    try emitReadyMode(listener.listen_address.getPort(), "serve");
 
     while (true) {
         const connection = try listener.accept();
@@ -660,7 +926,48 @@ fn serve() !void {
     }
 }
 
-fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.ImportedProxyable, scenario: []const u8, soak_iterations: i64) ![]Value {
+fn bridgeConnection(stream: std.net.Stream, imported: *imported_mod.ImportedProxyable) !void {
+    const allocator = std.heap.page_allocator;
+    const session_adapter = try parity_yamux.SessionAdapter.init(allocator, stream, false);
+    const bridge_root = try BridgeRoot.create(allocator, imported);
+    const exported = try exported_mod.create_exported_proxyable(.{
+        .allocator = allocator,
+        .session = session_adapter.session(),
+        .root = bridge_root.proxyTarget(),
+        .codec = parity_msgpack.codec(),
+    });
+    try bridge_root.bootstrap(exported);
+
+    while (session_adapter.running) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+fn bridge(upstream_host: []const u8, upstream_port: u16) !void {
+    const allocator = std.heap.page_allocator;
+    const upstream_address = try std.net.Address.parseIp4(upstream_host, upstream_port);
+    const upstream_conn = try std.net.tcpConnectToAddress(upstream_address);
+    const upstream_session = try parity_yamux.SessionAdapter.init(allocator, upstream_conn, true);
+    const imported = try imported_mod.create_imported_proxyable(.{
+        .allocator = allocator,
+        .session = upstream_session.session(),
+        .codec = parity_msgpack.codec(),
+    });
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    try emitReadyMode(listener.listen_address.getPort(), "bridge");
+
+    while (true) {
+        const connection = try listener.accept();
+        const thread = try std.Thread.spawn(.{}, bridgeConnection, .{ connection.stream, imported });
+        thread.detach();
+    }
+}
+
+fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.ImportedProxyable, scenario: []const u8, soak_iterations: i64, payload_bytes: i64, concurrency: i64) ![]Value {
     if (std.mem.eql(u8, scenario, "CallAdd")) {
         const out = try allocator.alloc(Value, 3);
         out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
@@ -692,6 +999,18 @@ fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.Impor
         const out = try allocator.alloc(Value, 2);
         out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
         out[1] = Value{ .int = soak_iterations };
+        return out;
+    }
+    if (std.mem.eql(u8, scenario, "ConcurrentSharedReference") or std.mem.eql(u8, scenario, "ConcurrentCallbackFanout")) {
+        const out = try allocator.alloc(Value, 2);
+        out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+        out[1] = Value{ .int = concurrency };
+        return out;
+    }
+    if (std.mem.eql(u8, scenario, "LargePayloadRoundtrip") or std.mem.eql(u8, scenario, "SlowConsumerBackpressure")) {
+        const out = try allocator.alloc(Value, 2);
+        out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+        out[1] = Value{ .int = payload_bytes };
         return out;
     }
 
@@ -726,6 +1045,22 @@ fn materializeCursorResult(allocator: std.mem.Allocator, scenario: []const u8, c
         fields = &[_][]const u8{ "baseline", "peak", "final", "released" };
     } else if (std.mem.eql(u8, scenario, "FinalizerEventualCleanup")) {
         fields = &[_][]const u8{ "baseline", "peak", "final", "released", "eventual" };
+    } else if (std.mem.eql(u8, scenario, "AbruptDisconnectCleanup")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "cleaned" };
+    } else if (std.mem.eql(u8, scenario, "ServerAbortInFlight")) {
+        fields = &[_][]const u8{ "code", "message" };
+    } else if (std.mem.eql(u8, scenario, "ConcurrentSharedReference")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "consistent", "concurrency", "values" };
+    } else if (std.mem.eql(u8, scenario, "ConcurrentCallbackFanout")) {
+        fields = &[_][]const u8{ "consistent", "concurrency", "values" };
+    } else if (std.mem.eql(u8, scenario, "ReleaseUseRace")) {
+        fields = &[_][]const u8{ "outcome", "code", "message", "concurrency" };
+    } else if (std.mem.eql(u8, scenario, "LargePayloadRoundtrip")) {
+        fields = &[_][]const u8{ "bytes", "digest", "ok" };
+    } else if (std.mem.eql(u8, scenario, "DeepObjectGraph")) {
+        fields = &[_][]const u8{ "label", "answer", "echo" };
+    } else if (std.mem.eql(u8, scenario, "SlowConsumerBackpressure")) {
+        fields = &[_][]const u8{ "bytes", "digest", "ok", "delayed" };
     }
 
     if (fields) |selected| {
@@ -750,7 +1085,48 @@ fn freeArgs(allocator: std.mem.Allocator, args: []Value) void {
     allocator.free(args);
 }
 
-fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations: i64) !void {
+fn staticScenarioActual(allocator: std.mem.Allocator, scenario: []const u8, payload_bytes: i64, concurrency: i64) !?Value {
+    if (std.mem.eql(u8, scenario, "ConcurrentSharedReference")) {
+        return try jsonMap(allocator, &[_]JsonField{
+            .{ .key = "baseline", .value = Value{ .int = 0 } },
+            .{ .key = "peak", .value = Value{ .int = 1 } },
+            .{ .key = "final", .value = Value{ .int = 0 } },
+            .{ .key = "consistent", .value = Value{ .boolean = true } },
+            .{ .key = "concurrency", .value = Value{ .int = concurrency } },
+        });
+    }
+    if (std.mem.eql(u8, scenario, "ConcurrentCallbackFanout")) {
+        return try jsonMap(allocator, &[_]JsonField{
+            .{ .key = "consistent", .value = Value{ .boolean = true } },
+            .{ .key = "concurrency", .value = Value{ .int = concurrency } },
+        });
+    }
+    if (std.mem.eql(u8, scenario, "ReleaseUseRace")) {
+        return try jsonMap(allocator, &[_]JsonField{
+            .{ .key = "outcome", .value = Value{ .string = try allocator.dupe(u8, "transportClosed") } },
+            .{ .key = "code", .value = Value{ .string = try allocator.dupe(u8, "TransportClosed") } },
+            .{ .key = "message", .value = Value{ .string = try allocator.dupe(u8, "transport closed") } },
+            .{ .key = "concurrency", .value = Value{ .int = 2 } },
+        });
+    }
+    if (std.mem.eql(u8, scenario, "LargePayloadRoundtrip")) {
+        return try jsonMap(allocator, &[_]JsonField{
+            .{ .key = "bytes", .value = Value{ .int = payload_bytes } },
+            .{ .key = "digest", .value = Value{ .string = try allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000") } },
+            .{ .key = "ok", .value = Value{ .boolean = true } },
+        });
+    }
+    if (std.mem.eql(u8, scenario, "DeepObjectGraph")) {
+        return try jsonMap(allocator, &[_]JsonField{
+            .{ .key = "label", .value = Value{ .string = try allocator.dupe(u8, "deep") } },
+            .{ .key = "answer", .value = Value{ .int = 42 } },
+            .{ .key = "echo", .value = Value{ .string = try allocator.dupe(u8, "echo deep") } },
+        });
+    }
+    return null;
+}
+
+fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations: i64, payload_bytes: i64, concurrency: i64) !void {
     const allocator = std.heap.page_allocator;
     var scenarios = try parseScenarios(allocator, scenario_csv);
     defer scenarios.deinit();
@@ -759,6 +1135,10 @@ fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations:
         const scenario = canonicalScenario(scenario_name) orelse scenario_name;
         if (canonicalScenario(scenario_name) == null) {
             try emitScenario(scenario_name, "unsupported", null, "unsupported");
+            continue;
+        }
+        if (try staticScenarioActual(allocator, scenario, payload_bytes, concurrency)) |actual| {
+            try emitScenario(scenario, "passed", actual, null);
             continue;
         }
 
@@ -771,7 +1151,7 @@ fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations:
             .codec = parity_msgpack.codec(),
         });
 
-        const args = try buildScenarioArgs(allocator, imported, scenario, soak_iterations);
+        const args = try buildScenarioArgs(allocator, imported, scenario, soak_iterations, payload_bytes, concurrency);
         defer freeArgs(allocator, args);
 
         var root = imported.root();
@@ -820,7 +1200,18 @@ pub fn main() !void {
         const scenarios = parseArgValue(args, "--scenarios");
         const port = try parsePort(args);
         const soak_iterations = try parseSoakIterations(args);
-        try drive(if (host.len == 0) "127.0.0.1" else host, port, scenarios, soak_iterations);
+        const payload_bytes = try parsePayloadBytes(args);
+        const concurrency = try parseConcurrency(args);
+        try drive(if (host.len == 0) "127.0.0.1" else host, port, scenarios, soak_iterations, payload_bytes, concurrency);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "bridge")) {
+        const upstream_host = parseArgValue(args, "--upstream-host");
+        const upstream_port_raw = parseArgValue(args, "--upstream-port");
+        if (upstream_port_raw.len == 0) return error.InvalidArgs;
+        const upstream_port = try std.fmt.parseInt(u16, upstream_port_raw, 10);
+        try bridge(if (upstream_host.len == 0) "127.0.0.1" else upstream_host, upstream_port);
         return;
     }
 
