@@ -20,10 +20,17 @@ pub const Proxyable = struct {
     pub var exports: Registry = .{};
     pub var imports: Registry = .{};
 
+    pub const Export = export;
+    pub const ImportFrom = import_from;
+
     pub fn @"export"(params: anytype) !@TypeOf(exported.create_exported_proxyable(params)) {
         const proxy = try exported.create_exported_proxyable(params);
         try register(&exports, proxy);
         return proxy;
+    }
+
+    pub fn Export(params: anytype) !@TypeOf(exported.create_exported_proxyable(params)) {
+        return try export(params);
     }
 
     pub fn import_from(params: anytype) !cursor.ProxyCursor {
@@ -31,7 +38,14 @@ pub const Proxyable = struct {
         try register(&imports, imported_proxy);
         return imported_proxy.root();
     }
+
+    pub fn ImportFrom(params: anytype) !cursor.ProxyCursor {
+        return try import_from(params);
+    }
 };
+
+pub const Export = Proxyable.Export;
+pub const ImportFrom = Proxyable.ImportFrom;
 
 const Registry = std.StringHashMapUnmanaged(*const anyopaque);
 

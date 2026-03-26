@@ -42,7 +42,7 @@ const API = struct {
 };
 
 var api = API{};
-const exported = try proxyables.Proxyable.export(.{
+const exported = try proxyables.Export(.{
     .allocator = allocator,
     .session = session,
     .root = api.proxyTarget(),
@@ -53,7 +53,7 @@ const exported = try proxyables.Proxyable.export(.{
 ```zig
 const proxyables = @import("proxyables");
 
-const cursor = try proxyables.Proxyable.import_from(.{
+const cursor = try proxyables.ImportFrom(.{
     .allocator = allocator,
     .session = session,
 });
