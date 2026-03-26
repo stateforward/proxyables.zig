@@ -71,8 +71,8 @@ pub const ImportedProxyable = struct {
         while (self.running) {
             const instr = self.codec.read(self.allocator, stream) catch break;
             defer deinit_instruction(self.allocator, instr);
-            const response = self.handle_instruction(instr) catch {
-                const err_instr = instructions_mod.create_throw_instruction(self.allocator, ProxyError{ .message = "execution error" }) catch break;
+            const response = self.handle_instruction(instr) catch |err| {
+                const err_instr = instructions_mod.create_throw_instruction(self.allocator, ProxyError{ .message = @errorName(err) }) catch break;
                 _ = self.codec.write(self.allocator, stream, err_instr) catch {};
                 deinit_instruction(self.allocator, err_instr);
                 break;
@@ -98,7 +98,10 @@ pub const ImportedProxyable = struct {
                 const result = try executor_mod.evaluate_instructions(self.allocator, instructions, &self.registry, null);
                 defer {
                     if (result.id) |id| self.allocator.free(id);
-                    if (result.metadata) |*meta| meta.deinit(self.allocator);
+                    if (result.metadata) |meta| {
+                        var mutable = meta;
+                        mutable.deinit(self.allocator);
+                    }
                 }
                 return instructions_mod.create_return_instruction(self.allocator, result.data);
             },
@@ -154,8 +157,12 @@ fn execute(ctx: *anyopaque, allocator: std.mem.Allocator, instructions: []const 
 
 fn deinit_instruction(allocator: std.mem.Allocator, instr: ProxyInstruction) void {
     if (instr.id) |id| allocator.free(id);
-    instr.data.deinit(allocator);
-    if (instr.metadata) |*meta| meta.deinit(allocator);
+    var data = instr.data;
+    data.deinit(allocator);
+    if (instr.metadata) |meta| {
+        var mutable = meta;
+        mutable.deinit(allocator);
+    }
 }
 
 const executor_vtable = cursor_mod.Executor.VTable{ .execute = execute };

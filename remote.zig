@@ -68,7 +68,10 @@ pub fn unwrap_response(
             }
             const result_value = value_instr.data;
             if (value_instr.id) |id| allocator.free(id);
-            if (value_instr.metadata) |*meta| meta.deinit(allocator);
+            if (value_instr.metadata) |meta| {
+                var mutable = meta;
+                mutable.deinit(allocator);
+            }
             return .{ .value = result_value };
         },
         else => {

@@ -10,7 +10,7 @@ pub const StreamPool = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     open: usize = 0,
-    idle: std.ArrayList(transport.Stream),
+    idle: std.array_list.Managed(transport.Stream),
     shutdown: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, session: transport.Session, max: usize, reuse: bool) StreamPool {
@@ -19,7 +19,7 @@ pub const StreamPool = struct {
             .session = session,
             .max = if (max < 1) 1 else max,
             .reuse = reuse,
-            .idle = std.ArrayList(transport.Stream).init(allocator),
+            .idle = std.array_list.Managed(transport.Stream).init(allocator),
         };
     }
 
@@ -36,7 +36,7 @@ pub const StreamPool = struct {
                 return error.StreamPoolClosed;
             }
             if (self.idle.items.len > 0) {
-                const stream = self.idle.pop();
+                const stream = self.idle.pop().?;
                 self.mutex.unlock();
                 return stream;
             }
@@ -48,17 +48,14 @@ pub const StreamPool = struct {
         }
         self.mutex.unlock();
 
-        const stream_result = self.session.open();
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (stream_result) |stream| {
-            return stream;
-        } else |err| {
+        const stream = self.session.open() catch |err| {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             self.open -= 1;
             self.cond.signal();
             return err;
-        }
+        };
+        return stream;
     }
 
     pub fn release(self: *StreamPool, stream: transport.Stream) void {

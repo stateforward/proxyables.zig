@@ -9,9 +9,9 @@ pub const ProxyTarget = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        get: fn (ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!Value,
-        apply: fn (ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) anyerror!Value,
-        construct: fn (ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) anyerror!Value,
+        get: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!Value,
+        apply: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) anyerror!Value,
+        construct: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) anyerror!Value,
     };
 
     pub fn get(self: ProxyTarget, allocator: std.mem.Allocator, name: []const u8) !Value {
@@ -58,7 +58,7 @@ pub const ObjectRegistry = struct {
     pub fn register(self: *ObjectRegistry, target: ProxyTarget) ![]const u8 {
         const key = TargetKey{ .ctx = target.ctx, .vtable = target.vtable };
         if (self.reverse.get(key)) |existing_id| {
-            if (self.entries.get(existing_id)) |*entry| {
+            if (self.entries.getPtr(existing_id)) |entry| {
                 entry.count += 1;
             }
             return existing_id;
@@ -92,7 +92,7 @@ pub const ObjectRegistry = struct {
                 self.allocator.free(id);
                 return;
             }
-            if (self.entries.get(id)) |*mutable| {
+            if (self.entries.getPtr(id)) |mutable| {
                 mutable.count -= 1;
             }
         }

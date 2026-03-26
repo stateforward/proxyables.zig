@@ -19,7 +19,7 @@ pub const Executor = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        execute: fn (ctx: *anyopaque, allocator: std.mem.Allocator, instructions: []const ProxyInstruction) anyerror!ExecutionResult,
+        execute: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, instructions: []const ProxyInstruction) anyerror!ExecutionResult,
     };
 
     pub fn execute(self: Executor, allocator: std.mem.Allocator, instructions: []const ProxyInstruction) !ExecutionResult {

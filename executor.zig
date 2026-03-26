@@ -17,7 +17,7 @@ pub fn evaluate_instructions(
     registry: *registry_mod.ObjectRegistry,
     root: ?ProxyTarget,
 ) !ProxyInstruction {
-    var stack = std.ArrayList(ProxyInstruction).init(allocator);
+    var stack = std.array_list.Managed(ProxyInstruction).init(allocator);
     defer stack.deinit();
 
     for (instructions) |instr| {
@@ -114,6 +114,10 @@ fn clone_instruction(allocator: std.mem.Allocator, instr: ProxyInstruction) !Pro
 
 fn deinit_instruction(allocator: std.mem.Allocator, instr: ProxyInstruction) void {
     if (instr.id) |id| allocator.free(id);
-    instr.data.deinit(allocator);
-    if (instr.metadata) |*meta| meta.deinit(allocator);
+    var data = instr.data;
+    data.deinit(allocator);
+    if (instr.metadata) |meta| {
+        var mutable = meta;
+        mutable.deinit(allocator);
+    }
 }

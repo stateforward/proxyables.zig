@@ -5,9 +5,9 @@ pub const Stream = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        read: fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
-        write: fn (ctx: *anyopaque, buf: []const u8) anyerror!void,
-        close: fn (ctx: *anyopaque) void,
+        read: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
+        write: *const fn (ctx: *anyopaque, buf: []const u8) anyerror!void,
+        close: *const fn (ctx: *anyopaque) void,
     };
 
     pub fn read(self: Stream, buf: []u8) !usize {
@@ -28,9 +28,9 @@ pub const Session = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        open: fn (ctx: *anyopaque) anyerror!Stream,
-        accept: fn (ctx: *anyopaque) anyerror!Stream,
-        close: ?fn (ctx: *anyopaque) void,
+        open: *const fn (ctx: *anyopaque) anyerror!Stream,
+        accept: *const fn (ctx: *anyopaque) anyerror!Stream,
+        close: ?*const fn (ctx: *anyopaque) void,
     };
 
     pub fn open(self: Session) !Stream {

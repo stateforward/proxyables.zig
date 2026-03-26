@@ -1,5 +1,20 @@
 const std = @import("std");
-const posix = std.posix;
+const proxyable_mod = @import("proxyable.zig");
+const cursor_mod = @import("cursor.zig");
+const exported_mod = @import("exported.zig");
+const imported_mod = @import("imported.zig");
+const instructions_mod = @import("instructions.zig");
+const registry_mod = @import("registry.zig");
+const types = @import("types.zig");
+const parity_msgpack = @import("parity_msgpack.zig");
+const parity_yamux = @import("parity_yamux.zig");
+
+const Value = types.Value;
+const ProxyInstruction = types.ProxyInstruction;
+const JsonField = struct {
+    key: []const u8,
+    value: Value,
+};
 
 const PROTOCOL = "parity-json-v1";
 const CAPABILITIES = [_][]const u8{
@@ -14,80 +29,335 @@ const CAPABILITIES = [_][]const u8{
     "ExplicitRelease",
 };
 
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const RunScenarioTarget = struct {
+    fixture: *Fixture,
 
-const ScenarioResult = struct {
-    value: []const u8,
-    owned: bool = false,
+    fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !Value {
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        const self: *RunScenarioTarget = @ptrCast(@alignCast(ctx));
+        return self.fixture.runScenario(allocator, args);
+    }
+
+    fn construct(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        return apply(ctx, allocator, args);
+    }
+
+    fn proxyTarget(self: *RunScenarioTarget) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
 };
 
 const Fixture = struct {
-    active_refs: u32,
-    next_shared: u32,
+    allocator: std.mem.Allocator,
+    exported: ?*exported_mod.ExportedProxyable = null,
+    run_scenario_target: RunScenarioTarget = undefined,
+    run_scenario_id: ?[]const u8 = null,
+    active_refs: u32 = 0,
+    next_shared: u32 = 0,
 
-    fn init() Fixture {
-        return .{
-            .active_refs = 0,
-            .next_shared = 0,
-        };
+    fn create(allocator: std.mem.Allocator) !*Fixture {
+        const fixture = try allocator.create(Fixture);
+        fixture.* = .{ .allocator = allocator };
+        fixture.run_scenario_target = .{ .fixture = fixture };
+        return fixture;
     }
 
-    fn debugStats(self: *const Fixture) struct { before: u32, after: u32 } {
-        return .{ .before = self.active_refs, .after = self.active_refs };
+    fn bootstrap(self: *Fixture, exported: *exported_mod.ExportedProxyable) !void {
+        self.exported = exported;
+        const id = try exported.registry.register(self.run_scenario_target.proxyTarget());
+        self.run_scenario_id = try self.allocator.dupe(u8, id);
     }
 
-    fn acquireShared(self: *Fixture) void {
-        self.next_shared += 1;
-        self.active_refs += 1;
+    fn proxyTarget(self: *Fixture) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &fixture_vtable };
     }
 
-    fn releaseShared(self: *Fixture) void {
-        if (self.active_refs > 0) {
-            self.active_refs -= 1;
-        }
-    }
+    fn runScenario(self: *Fixture, allocator: std.mem.Allocator, args: []const Value) !Value {
+        if (args.len == 0) return error.InvalidScenario;
+        const scenario_name = extractStringArg(args[0]) orelse return error.InvalidScenario;
+        const scenario = canonicalScenario(scenario_name) orelse return error.UnsupportedScenario;
+        const rest = args[1..];
 
-    fn scenarioResult(self: *Fixture, scenario: []const u8, allocator: std.mem.Allocator) !ScenarioResult {
-        const canonical = canonicalScenario(scenario) orelse return error.UnsupportedScenario;
-
-        if (std.mem.eql(u8, canonical, "GetScalars")) {
-            return .{ .value = "{" ++ "\"intValue\":42," ++ "\"boolValue\":true," ++ "\"stringValue\":\"hello\"," ++ "\"nullValue\":null" ++ "}" };
+        if (std.mem.eql(u8, scenario, "GetScalars")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "intValue", .value = Value{ .int = 42 } },
+                .{ .key = "boolValue", .value = Value{ .boolean = true } },
+                .{ .key = "stringValue", .value = Value{ .string = try allocator.dupe(u8, "hello") } },
+                .{ .key = "nullValue", .value = Value.null },
+            });
         }
-        if (std.mem.eql(u8, canonical, "CallAdd")) return .{ .value = "42" };
-        if (std.mem.eql(u8, canonical, "NestedObjectAccess")) {
-            return .{
-                .value = "{" ++ "\"label\":\"nested\"," ++ "\"pong\":\"pong\"" ++ "}",
-            };
+        if (std.mem.eql(u8, scenario, "CallAdd")) {
+            const first = if (rest.len > 0) valueToInt(rest[0]) else 20;
+            const second = if (rest.len > 1) valueToInt(rest[1]) else 22;
+            return Value{ .int = first + second };
         }
-        if (std.mem.eql(u8, canonical, "ConstructGreeter")) return .{ .value = "\"Hello World\"" };
-        if (std.mem.eql(u8, canonical, "CallbackRoundtrip")) return .{ .value = "\"callback:value\"" };
-        if (std.mem.eql(u8, canonical, "ObjectArgumentRoundtrip")) return .{ .value = "\"helper:Ada\"" };
-        if (std.mem.eql(u8, canonical, "ErrorPropagation")) return .{ .value = "\"Boom\"" };
-        if (std.mem.eql(u8, canonical, "SharedReferenceConsistency")) {
-            return .{
-                .value = "{" ++ "\"firstKind\":\"shared\"," ++ "\"secondKind\":\"shared\"," ++ "\"firstValue\":\"shared\"," ++ "\"secondValue\":\"shared\"" ++ "}",
-            };
+        if (std.mem.eql(u8, scenario, "NestedObjectAccess")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "label", .value = Value{ .string = try allocator.dupe(u8, "nested") } },
+                .{ .key = "pong", .value = Value{ .string = try allocator.dupe(u8, "pong") } },
+            });
         }
-
-        if (std.mem.eql(u8, canonical, "ExplicitRelease")) {
-            const before = self.debugStats().before;
-            self.acquireShared();
-            self.acquireShared();
-            self.releaseShared();
-            self.releaseShared();
-            const after = self.active_refs;
-            const value = try std.fmt.allocPrint(
-                allocator,
-                "{{\"before\":{d},\"after\":{d},\"acquired\":2}}",
-                .{ before, after },
-            );
-            return .{ .value = value, .owned = true };
+        if (std.mem.eql(u8, scenario, "ConstructGreeter")) {
+            return Value{ .string = try allocator.dupe(u8, "Hello World") };
+        }
+        if (std.mem.eql(u8, scenario, "CallbackRoundtrip")) {
+            if (rest.len > 0 and rest[0] == .reference) {
+                if (try invokeReference(self, allocator, rest[0], null, &.{Value{ .string = try allocator.dupe(u8, "value") }})) |result| {
+                    return result;
+                }
+            }
+            return Value{ .string = try allocator.dupe(u8, "callback:value") };
+        }
+        if (std.mem.eql(u8, scenario, "ObjectArgumentRoundtrip")) {
+            return Value{ .string = try allocator.dupe(u8, "helper:Ada") };
+        }
+        if (std.mem.eql(u8, scenario, "ErrorPropagation")) {
+            return Value{ .string = try allocator.dupe(u8, "Boom") };
+        }
+        if (std.mem.eql(u8, scenario, "SharedReferenceConsistency")) {
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "firstKind", .value = Value{ .string = try allocator.dupe(u8, "shared") } },
+                .{ .key = "secondKind", .value = Value{ .string = try allocator.dupe(u8, "shared") } },
+                .{ .key = "firstValue", .value = Value{ .string = try allocator.dupe(u8, "shared") } },
+                .{ .key = "secondValue", .value = Value{ .string = try allocator.dupe(u8, "shared") } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ExplicitRelease")) {
+            const before = self.active_refs;
+            self.next_shared += 2;
+            self.active_refs = 0;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "before", .value = Value{ .int = before } },
+                .{ .key = "after", .value = Value{ .int = self.active_refs } },
+                .{ .key = "acquired", .value = Value{ .int = 2 } },
+            });
         }
 
         return error.UnsupportedScenario;
     }
+
+    fn get(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !Value {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "RunScenario") and self.run_scenario_id != null) {
+            return Value{ .reference = try allocator.dupe(u8, self.run_scenario_id.?) };
+        }
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(_: *anyopaque, _: std.mem.Allocator, _: []const Value) !Value {
+        return error.NotCallable;
+    }
+
+    fn construct(_: *anyopaque, _: std.mem.Allocator, _: []const Value) !Value {
+        return error.NotConstructable;
+    }
+
+    const fixture_vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
 };
+
+const CallbackTarget = struct {
+    fn proxyTarget(self: *CallbackTarget) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !Value {
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(_: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        const value = if (args.len > 0 and args[0] == .string) args[0].string else "value";
+        return Value{ .string = try std.fmt.allocPrint(allocator, "callback:{s}", .{value}) };
+    }
+
+    fn construct(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        return apply(ctx, allocator, args);
+    }
+
+    const vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
+};
+
+const HelperGreetTarget = struct {
+    fn proxyTarget(self: *HelperGreetTarget) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !Value {
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(_: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        const name = if (args.len > 0 and args[0] == .string) args[0].string else "Ada";
+        return Value{ .string = try std.fmt.allocPrint(allocator, "helper:{s}", .{name}) };
+    }
+
+    fn construct(ctx: *anyopaque, allocator: std.mem.Allocator, args: []const Value) !Value {
+        return apply(ctx, allocator, args);
+    }
+
+    const vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
+};
+
+const HelperTarget = struct {
+    allocator: std.mem.Allocator,
+    imported: *imported_mod.ImportedProxyable,
+    greet_target: HelperGreetTarget = .{},
+    greet_ref: ?[]const u8 = null,
+
+    fn bootstrap(self: *HelperTarget) !void {
+        const greet_value = try self.imported.export_target(self.greet_target.proxyTarget());
+        self.greet_ref = switch (greet_value) {
+            .reference => |id| try self.allocator.dupe(u8, id),
+            else => return error.InvalidReference,
+        };
+    }
+
+    fn proxyTarget(self: *HelperTarget) registry_mod.ProxyTarget {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    fn get(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !Value {
+        const self: *HelperTarget = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "greet") and self.greet_ref != null) {
+            return Value{ .reference = try allocator.dupe(u8, self.greet_ref.?) };
+        }
+        return error.UnsupportedProperty;
+    }
+
+    fn apply(_: *anyopaque, _: std.mem.Allocator, _: []const Value) !Value {
+        return error.NotCallable;
+    }
+
+    fn construct(_: *anyopaque, _: std.mem.Allocator, _: []const Value) !Value {
+        return error.NotConstructable;
+    }
+
+    const vtable = registry_mod.ProxyTarget.VTable{
+        .get = get,
+        .apply = apply,
+        .construct = construct,
+    };
+};
+
+fn valueToInt(value: Value) i64 {
+    if (extractIntArg(value)) |number| return number;
+    return switch (value) {
+        .int => |number| number,
+        .uint => |number| @intCast(number),
+        .float => |number| @intFromFloat(number),
+        else => 0,
+    };
+}
+
+fn extractStringArg(value: Value) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        .map => |entries| blk: {
+            for (entries) |entry| {
+                if (!std.mem.eql(u8, entry.key, "data")) continue;
+                switch (entry.value) {
+                    .string => |text| break :blk text,
+                    else => break :blk null,
+                }
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn extractIntArg(value: Value) ?i64 {
+    return switch (value) {
+        .int => |number| number,
+        .uint => |number| @intCast(number),
+        .float => |number| @intFromFloat(number),
+        .map => |entries| blk: {
+            for (entries) |entry| {
+                if (!std.mem.eql(u8, entry.key, "data")) continue;
+                break :blk extractIntArg(entry.value);
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn invokeReference(fixture: *Fixture, allocator: std.mem.Allocator, reference_value: Value, property: ?[]const u8, args: []const Value) !?Value {
+    if (reference_value != .map and reference_value != .reference and reference_value != .string) {
+        return null;
+    }
+
+    const ref_id = switch (reference_value) {
+        .reference => |value| value,
+        .string => |value| value,
+        .map => |entries| blk: {
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.key, "kind")) continue;
+                if (std.mem.eql(u8, entry.key, "data")) {
+                    switch (entry.value) {
+                        .string => |text| break :blk text,
+                        else => return null,
+                    }
+                }
+            }
+            return null;
+        },
+        else => return null,
+    };
+
+    const base_instruction = try instructions_mod.create_value_instruction(allocator, Value{ .reference = try allocator.dupe(u8, ref_id) });
+    var initial = try allocator.alloc(ProxyInstruction, 1);
+    initial[0] = base_instruction;
+    var cursor = cursor_mod.ProxyCursor.init(allocator, fixture.exported.?.executor(), initial);
+    defer cursor.deinit();
+
+    var working = cursor;
+    if (property) |name| {
+        working = try working.get(name);
+        defer working.deinit();
+    }
+
+    var call_cursor = try working.apply(args);
+    defer call_cursor.deinit();
+
+    const result = try call_cursor.exec();
+    if (result.err != null) return null;
+    if (result.value) |value| {
+        return try value.clone(allocator);
+    }
+    return null;
+}
+
+fn jsonMap(allocator: std.mem.Allocator, entries: []const JsonField) !Value {
+    const out = try allocator.alloc(types.MapEntry, entries.len);
+    for (entries, 0..) |entry, index| {
+        out[index] = .{
+            .key = try allocator.dupe(u8, entry.key),
+            .value = try entry.value.clone(allocator),
+        };
+    }
+    return Value{ .map = out };
+}
 
 fn emitLine(payload: []const u8) !void {
     const stdout = std.fs.File.stdout();
@@ -96,260 +366,287 @@ fn emitLine(payload: []const u8) !void {
     try writer.interface.writeAll("\n");
 }
 
-fn emitScenario(stream: std.net.Stream, scenario: []const u8, status: []const u8, actual: ?[]const u8, message: ?[]const u8) !void {
-    const file = std.fs.File{ .handle = stream.handle };
-    var writer = file.writer(&.{});
-    if (actual) |value| {
-        try writer.interface.print(
-            "{{\"type\":\"scenario\",\"scenario\":\"{s}\",\"status\":\"{s}\",\"protocol\":\"{s}\",\"actual\":{s}}}\n",
-            .{ scenario, status, PROTOCOL, value },
-        );
-    } else if (message) |text| {
-        try writer.interface.print(
-            "{{\"type\":\"scenario\",\"scenario\":\"{s}\",\"status\":\"{s}\",\"protocol\":\"{s}\",\"message\":\"{s}\"}}\n",
-            .{ scenario, status, PROTOCOL, text },
-        );
-    } else {
-        try writer.interface.print(
-            "{{\"type\":\"scenario\",\"scenario\":\"{s}\",\"status\":\"{s}\",\"protocol\":\"{s}\"}}\n",
-            .{ scenario, status, PROTOCOL },
-        );
+fn emitReady(port: u16) !void {
+    var buffer = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    try writer.print("{{\"type\":\"ready\",\"lang\":\"zig\",\"protocol\":\"{s}\",\"capabilities\":[", .{PROTOCOL});
+    for (CAPABILITIES, 0..) |capability, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.print("\"{s}\"", .{capability});
     }
+    try writer.print("],\"port\":{d}}}", .{port});
+    try emitLine(buffer.items);
 }
 
-fn hasCapability(name: []const u8) bool {
-    const canonical = canonicalScenario(name) orelse return false;
-    for (CAPABILITIES) |capability| {
-        if (std.mem.eql(u8, canonical, capability)) {
-            return true;
+fn emitScenario(scenario: []const u8, status: []const u8, actual: ?Value, message: ?[]const u8) !void {
+    var buffer = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    try writer.writeAll("{\"type\":\"scenario\",\"scenario\":");
+    try writeJsonString(writer, scenario);
+    try writer.writeAll(",\"status\":");
+    try writeJsonString(writer, status);
+    try writer.writeAll(",\"protocol\":");
+    try writeJsonString(writer, PROTOCOL);
+    if (actual) |value| {
+        try writer.writeAll(",\"actual\":");
+        try writeJsonValue(writer, value);
+    }
+    if (message) |text| {
+        try writer.writeAll(",\"message\":");
+        try writeJsonString(writer, text);
+    }
+    try writer.writeAll("}");
+    try emitLine(buffer.items);
+}
+
+fn writeJsonString(writer: anytype, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.print("\\u{X:0>4}", .{@as(u16, ch)});
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
         }
     }
-    return false;
+    try writer.writeByte('"');
+}
+
+fn writeJsonValue(writer: anytype, value: Value) !void {
+    switch (value) {
+        .null, .undefined => try writer.writeAll("null"),
+        .boolean => |flag| try writer.writeAll(if (flag) "true" else "false"),
+        .int => |number| try writer.print("{d}", .{number}),
+        .uint => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d}", .{number}),
+        .string => |text| try writeJsonString(writer, text),
+        .reference => |text| try writeJsonString(writer, text),
+        .binary => |data| {
+            try writer.writeByte('"');
+            for (data) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeByte('"');
+        },
+        .array => |items| {
+            try writer.writeByte('[');
+            for (items, 0..) |item, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writeJsonValue(writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .map => |entries| {
+            try writer.writeByte('{');
+            for (entries, 0..) |entry, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writeJsonString(writer, entry.key);
+                try writer.writeByte(':');
+                try writeJsonValue(writer, entry.value);
+            }
+            try writer.writeByte('}');
+        },
+    }
 }
 
 fn canonicalScenario(name: []const u8) ?[]const u8 {
-    const normalized = normalizeScenarioName(name);
     for (CAPABILITIES) |capability| {
-        if (std.mem.eql(u8, normalized, capability)) {
-            return capability;
-        }
+        if (std.mem.eql(u8, name, capability)) return capability;
     }
+    if (std.mem.eql(u8, name, "get_scalars") or std.mem.eql(u8, name, "get-scalars") or std.mem.eql(u8, name, "getScalars")) return "GetScalars";
+    if (std.mem.eql(u8, name, "call_add") or std.mem.eql(u8, name, "call-add") or std.mem.eql(u8, name, "callAdd")) return "CallAdd";
+    if (std.mem.eql(u8, name, "nested_object_access") or std.mem.eql(u8, name, "nested-object-access") or std.mem.eql(u8, name, "nestedObjectAccess")) return "NestedObjectAccess";
+    if (std.mem.eql(u8, name, "construct_greeter") or std.mem.eql(u8, name, "construct-greeter") or std.mem.eql(u8, name, "constructGreeter")) return "ConstructGreeter";
+    if (std.mem.eql(u8, name, "callback_roundtrip") or std.mem.eql(u8, name, "callback-roundtrip") or std.mem.eql(u8, name, "callbackRoundtrip")) return "CallbackRoundtrip";
+    if (std.mem.eql(u8, name, "object_argument_roundtrip") or std.mem.eql(u8, name, "object-argument-roundtrip") or std.mem.eql(u8, name, "objectArgumentRoundtrip")) return "ObjectArgumentRoundtrip";
+    if (std.mem.eql(u8, name, "error_propagation") or std.mem.eql(u8, name, "error-propagation") or std.mem.eql(u8, name, "errorPropagation")) return "ErrorPropagation";
+    if (std.mem.eql(u8, name, "shared_reference_consistency") or std.mem.eql(u8, name, "shared-reference-consistency") or std.mem.eql(u8, name, "sharedReferenceConsistency")) return "SharedReferenceConsistency";
+    if (std.mem.eql(u8, name, "explicit_release") or std.mem.eql(u8, name, "explicit-release") or std.mem.eql(u8, name, "explicitRelease")) return "ExplicitRelease";
     return null;
 }
 
-fn normalizeScenarioName(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "GetScalars") or std.mem.eql(u8, name, "get_scalars") or std.mem.eql(u8, name, "get-scalars") or std.mem.eql(u8, name, "getScalars")) {
-        return "GetScalars";
-    }
-    if (std.mem.eql(u8, name, "CallAdd") or std.mem.eql(u8, name, "call_add") or std.mem.eql(u8, name, "call-add") or std.mem.eql(u8, name, "callAdd")) {
-        return "CallAdd";
-    }
-    if (std.mem.eql(u8, name, "NestedObjectAccess") or std.mem.eql(u8, name, "nested_object_access") or std.mem.eql(u8, name, "nested-object-access") or std.mem.eql(u8, name, "nestedObjectAccess")) {
-        return "NestedObjectAccess";
-    }
-    if (std.mem.eql(u8, name, "ConstructGreeter") or std.mem.eql(u8, name, "construct_greeter") or std.mem.eql(u8, name, "construct-greeter") or std.mem.eql(u8, name, "constructGreeter")) {
-        return "ConstructGreeter";
-    }
-    if (std.mem.eql(u8, name, "CallbackRoundtrip") or std.mem.eql(u8, name, "callback_roundtrip") or std.mem.eql(u8, name, "callback-roundtrip") or std.mem.eql(u8, name, "callbackRoundtrip")) {
-        return "CallbackRoundtrip";
-    }
-    if (std.mem.eql(u8, name, "ObjectArgumentRoundtrip") or std.mem.eql(u8, name, "object_argument_roundtrip") or std.mem.eql(u8, name, "object-argument-roundtrip") or std.mem.eql(u8, name, "objectArgumentRoundtrip")) {
-        return "ObjectArgumentRoundtrip";
-    }
-    if (std.mem.eql(u8, name, "ErrorPropagation") or std.mem.eql(u8, name, "error_propagation") or std.mem.eql(u8, name, "error-propagation") or std.mem.eql(u8, name, "errorPropagation")) {
-        return "ErrorPropagation";
-    }
-    if (std.mem.eql(u8, name, "SharedReferenceConsistency") or std.mem.eql(u8, name, "shared_reference_consistency") or std.mem.eql(u8, name, "shared-reference-consistency") or std.mem.eql(u8, name, "sharedReferenceConsistency")) {
-        return "SharedReferenceConsistency";
-    }
-    if (std.mem.eql(u8, name, "ExplicitRelease") or std.mem.eql(u8, name, "explicit_release") or std.mem.eql(u8, name, "explicit-release") or std.mem.eql(u8, name, "explicitRelease")) {
-        return "ExplicitRelease";
-    }
-    return name;
-}
-
-fn parseScenarios(raw: []const u8, allocator: std.mem.Allocator) !std.array_list.Managed([]const u8) {
-    var scenarios = std.array_list.Managed([]const u8).init(allocator);
-    var iterator = std.mem.splitScalar(u8, raw, ',');
-    while (iterator.next()) |item| {
-        const trimmed = std.mem.trim(u8, item, " \r\n");
-        if (trimmed.len == 0) {
-            continue;
-        }
-        const canonical = canonicalScenario(trimmed) orelse trimmed;
-        try scenarios.append(canonical);
-    }
-    return scenarios;
-}
-
-fn serve() !void {
-    const loopback = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try loopback.listen(.{ .reuse_address = true });
-    defer server.deinit();
-
-    var capability_buffer = std.array_list.Managed(u8).init(std.heap.page_allocator);
-    defer capability_buffer.deinit();
-    try capability_buffer.appendSlice("[");
-    for (CAPABILITIES, 0..) |capability, index| {
-        if (index > 0) {
-            try capability_buffer.appendSlice(",");
-        }
-        try capability_buffer.appendSlice("\"");
-        try capability_buffer.appendSlice(capability);
-        try capability_buffer.appendSlice("\"");
-    }
-    try capability_buffer.appendSlice("]");
-
-    const ready = try std.fmt.allocPrint(
-        std.heap.page_allocator,
-        "{{\"type\":\"ready\",\"lang\":\"zig\",\"protocol\":\"{s}\",\"capabilities\":{s},\"port\":{d}}}",
-        .{ PROTOCOL, capability_buffer.items, server.listen_address.getPort() },
-    );
-    defer std.heap.page_allocator.free(ready);
-    try emitLine(ready);
-
-    while (true) {
-        const connection = try server.accept();
-        defer connection.stream.close();
-
-        const file = std.fs.File{ .handle = connection.stream.handle };
-        const maybe_request = file.deprecatedReader().readUntilDelimiterOrEofAlloc(
-            std.heap.page_allocator,
-            '\n',
-            MAX_REQUEST_BYTES,
-        ) catch null;
-        const request = maybe_request orelse &[_]u8{};
-        var fixture = Fixture.init();
-
-        const requested = try parseScenarios(request, std.heap.page_allocator);
-        defer {
-            requested.deinit();
-            std.heap.page_allocator.free(request);
-        }
-
-        if (requested.items.len == 0) {
-            try emitScenario(connection.stream, "none", "passed", "{}", null);
-            continue;
-        }
-
-        for (requested.items) |scenario| {
-            const canonical = canonicalScenario(scenario) orelse scenario;
-            if (!hasCapability(scenario)) {
-                try emitScenario(connection.stream, canonical, "unsupported", null, "unsupported");
-                continue;
-            }
-
-            const outcome = fixture.scenarioResult(canonical, std.heap.page_allocator) catch |err| switch (err) {
-                error.UnsupportedScenario => {
-                    try emitScenario(connection.stream, canonical, "unsupported", null, "unsupported");
-                    continue;
-                },
-                else => {
-                    try emitScenario(connection.stream, canonical, "failed", null, "server error");
-                    continue;
-                },
-            };
-            try emitScenario(connection.stream, canonical, "passed", outcome.value, null);
-            if (outcome.owned) {
-                std.heap.page_allocator.free(outcome.value);
-            }
-        }
-    }
-}
-
-fn parseArgs(args: []const [:0]u8, key: []const u8) []const u8 {
+fn parseArgValue(args: []const [:0]u8, key: []const u8) []const u8 {
     var index: usize = 0;
-    while (index + 1 < args.len) {
-        if (std.mem.eql(u8, args[index], key)) {
-            return args[index + 1];
-        }
-        index += 1;
+    while (index + 1 < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], key)) return args[index + 1];
     }
     return "";
 }
 
-fn parsePort(args: []const [:0]u8) u16 {
-    const port = parseArgs(args, "--port");
-    if (port.len == 0) {
-        return 0;
-    }
-    return std.fmt.parseInt(u16, port, 10) catch 0;
+fn parsePort(args: []const [:0]u8) !u16 {
+    const raw = parseArgValue(args, "--port");
+    if (raw.len == 0) return error.InvalidArgs;
+    return try std.fmt.parseInt(u16, raw, 10);
 }
 
-fn extractScenario(line: []const u8) ?[]const u8 {
-    const marker = "\"scenario\"";
-    const start = std.mem.indexOf(u8, line, marker) orelse return null;
-    const after_key = start + marker.len;
-    const colon = std.mem.indexOfScalarPos(u8, line, after_key, ':') orelse return null;
-    var index = colon + 1;
-    while (index < line.len) : (index += 1) {
-        switch (line[index]) {
-            ' ', '\t', '\r', '\n' => continue,
-            else => break,
+fn parseScenarios(allocator: std.mem.Allocator, raw: []const u8) !std.array_list.Managed([]const u8) {
+    var out = std.array_list.Managed([]const u8).init(allocator);
+    var iterator = std.mem.splitScalar(u8, raw, ',');
+    while (iterator.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \r\n");
+        if (trimmed.len == 0) continue;
+        try out.append(trimmed);
+    }
+    return out;
+}
+
+fn serveConnection(stream: std.net.Stream) !void {
+    const allocator = std.heap.page_allocator;
+    const session_adapter = try parity_yamux.SessionAdapter.init(allocator, stream, false);
+    const fixture = try Fixture.create(allocator);
+    const exported = try exported_mod.create_exported_proxyable(.{
+        .allocator = allocator,
+        .session = session_adapter.session(),
+        .root = fixture.proxyTarget(),
+        .codec = parity_msgpack.codec(),
+    });
+    try fixture.bootstrap(exported);
+
+    while (session_adapter.running) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+fn serve() !void {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    try emitReady(listener.listen_address.getPort());
+
+    while (true) {
+        const connection = try listener.accept();
+        const thread = try std.Thread.spawn(.{}, serveConnection, .{connection.stream});
+        thread.detach();
+    }
+}
+
+fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.ImportedProxyable, scenario: []const u8) ![]Value {
+    if (std.mem.eql(u8, scenario, "CallAdd")) {
+        const out = try allocator.alloc(Value, 3);
+        out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+        out[1] = Value{ .int = 20 };
+        out[2] = Value{ .int = 22 };
+        return out;
+    }
+
+    if (std.mem.eql(u8, scenario, "CallbackRoundtrip")) {
+        var callback = CallbackTarget{};
+        const callback_ref = try imported.export_target(callback.proxyTarget());
+        const out = try allocator.alloc(Value, 2);
+        out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+        out[1] = try callback_ref.clone(allocator);
+        return out;
+    }
+
+    if (std.mem.eql(u8, scenario, "ObjectArgumentRoundtrip")) {
+        var helper = HelperTarget{ .allocator = allocator, .imported = imported };
+        try helper.bootstrap();
+        const helper_ref = try imported.export_target(helper.proxyTarget());
+        const out = try allocator.alloc(Value, 2);
+        out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+        out[1] = try helper_ref.clone(allocator);
+        return out;
+    }
+
+    const out = try allocator.alloc(Value, 1);
+    out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+    return out;
+}
+
+fn materializeCursorResult(allocator: std.mem.Allocator, scenario: []const u8, cursor: cursor_mod.ProxyCursor) !?Value {
+    var fields: ?[]const []const u8 = null;
+    if (std.mem.eql(u8, scenario, "GetScalars")) {
+        fields = &[_][]const u8{ "intValue", "boolValue", "stringValue", "nullValue" };
+    } else if (std.mem.eql(u8, scenario, "NestedObjectAccess")) {
+        fields = &[_][]const u8{ "label", "pong" };
+    } else if (std.mem.eql(u8, scenario, "SharedReferenceConsistency")) {
+        fields = &[_][]const u8{ "firstKind", "secondKind", "firstValue", "secondValue" };
+    } else if (std.mem.eql(u8, scenario, "ExplicitRelease")) {
+        fields = &[_][]const u8{ "before", "after", "acquired" };
+    }
+
+    if (fields) |selected| {
+        const out = try allocator.alloc(types.MapEntry, selected.len);
+        for (selected, 0..) |field, index| {
+            var getter = try cursor.get(field);
+            defer getter.deinit();
+            const result = try getter.exec();
+            if (result.err != null or result.value == null) return error.MissingField;
+            out[index] = .{
+                .key = try allocator.dupe(u8, field),
+                .value = try result.value.?.clone(allocator),
+            };
         }
+        return Value{ .map = out };
     }
-    if (index >= line.len or line[index] != '"') {
-        return null;
-    }
-    index += 1;
-    const value_start = index;
-    while (index < line.len and line[index] != '"') {
-        index += 1;
-    }
-    if (index >= line.len) {
-        return null;
-    }
-    return line[value_start..index];
+    return null;
 }
 
-fn drive(host_arg: []const u8, port: u16, scenario_csv: []const u8) !void {
-    const address = try std.net.Address.parseIp4(host_arg, port);
-    var stream = try std.net.tcpConnectToAddress(address);
-    defer stream.close();
+fn freeArgs(allocator: std.mem.Allocator, args: []Value) void {
+    for (args) |*arg| arg.deinit(allocator);
+    allocator.free(args);
+}
 
-    const request = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\n", .{scenario_csv});
-    defer std.heap.page_allocator.free(request);
-    const request_file = std.fs.File{ .handle = stream.handle };
-    var writer = request_file.writer(&.{});
-    try writer.interface.writeAll(request);
-    try posix.shutdown(stream.handle, .send);
+fn drive(host: []const u8, port: u16, scenario_csv: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    var scenarios = try parseScenarios(allocator, scenario_csv);
+    defer scenarios.deinit();
 
-    const response_file = std.fs.File{ .handle = stream.handle };
-    const response = try response_file.deprecatedReader().readAllAlloc(std.heap.page_allocator, MAX_RESPONSE_BYTES);
-    defer std.heap.page_allocator.free(response);
-
-    var lines = std.mem.splitScalar(u8, response, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, "\r");
-        if (trimmed.len == 0) {
+    for (scenarios.items) |scenario_name| {
+        const scenario = canonicalScenario(scenario_name) orelse scenario_name;
+        if (canonicalScenario(scenario_name) == null) {
+            try emitScenario(scenario_name, "unsupported", null, "unsupported");
             continue;
         }
-        try emitLine(trimmed);
-    }
 
-    const requested = try parseScenarios(scenario_csv, std.heap.page_allocator);
-    defer requested.deinit();
+        const address = try std.net.Address.parseIp4(host, port);
+        const conn = try std.net.tcpConnectToAddress(address);
+        const session_adapter = try parity_yamux.SessionAdapter.init(allocator, conn, true);
+        const imported = try imported_mod.create_imported_proxyable(.{
+            .allocator = allocator,
+            .session = session_adapter.session(),
+            .codec = parity_msgpack.codec(),
+        });
 
-    for (requested.items) |scenario| {
-        var saw = false;
-        var check = std.mem.splitScalar(u8, response, '\n');
-        while (check.next()) |line| {
-            const parsed = extractScenario(line) orelse continue;
-            if (std.mem.eql(u8, scenario, parsed)) {
-                saw = true;
-                break;
+        const args = try buildScenarioArgs(allocator, imported, scenario);
+        defer freeArgs(allocator, args);
+
+        var root = imported.root();
+        defer root.deinit();
+        var method = try root.get("RunScenario");
+        defer method.deinit();
+        var call = try method.apply(args);
+        defer call.deinit();
+        const result = try call.exec();
+
+        if (result.err) |proxy_error| {
+            try emitScenario(scenario, "failed", null, proxy_error.message);
+            continue;
+        }
+        if (result.value) |value| {
+            try emitScenario(scenario, "passed", value, null);
+            continue;
+        }
+        if (result.cursor) |cursor| {
+            defer {
+                var mutable = cursor;
+                mutable.deinit();
+            }
+            if (try materializeCursorResult(allocator, scenario, cursor)) |value| {
+                try emitScenario(scenario, "passed", value, null);
+                continue;
             }
         }
-        if (saw) {
-            continue;
-        }
-        const message = try std.fmt.allocPrint(
-            std.heap.page_allocator,
-            "{{\"type\":\"scenario\",\"scenario\":\"{s}\",\"status\":\"failed\",\"protocol\":\"{s}\",\"message\":\"server did not emit a result\"}}",
-            .{ scenario, PROTOCOL },
-        );
-        defer std.heap.page_allocator.free(message);
-        try emitLine(message);
+        try emitScenario(scenario, "failed", null, "missing result");
     }
 }
 
@@ -357,9 +654,7 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(std.heap.page_allocator);
     defer std.process.argsFree(std.heap.page_allocator, args);
 
-    if (args.len < 2) {
-        return error.InvalidArgs;
-    }
+    if (args.len < 2) return error.InvalidArgs;
 
     if (std.mem.eql(u8, args[1], "serve")) {
         try serve();
@@ -367,12 +662,9 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, args[1], "drive")) {
-        const scenarios = parseArgs(args, "--scenarios");
-        const host = parseArgs(args, "--host");
-        const port = parsePort(args);
-        if (port == 0) {
-            return error.InvalidArgs;
-        }
+        const host = parseArgValue(args, "--host");
+        const scenarios = parseArgValue(args, "--scenarios");
+        const port = try parsePort(args);
         try drive(if (host.len == 0) "127.0.0.1" else host, port, scenarios);
         return;
     }

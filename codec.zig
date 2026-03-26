@@ -10,8 +10,8 @@ pub const Codec = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        write: fn (ctx: *anyopaque, allocator: std.mem.Allocator, stream: transport.Stream, instr: ProxyInstruction) anyerror!void,
-        read: fn (ctx: *anyopaque, allocator: std.mem.Allocator, stream: transport.Stream) anyerror!ProxyInstruction,
+        write: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, stream: transport.Stream, instr: ProxyInstruction) anyerror!void,
+        read: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, stream: transport.Stream) anyerror!ProxyInstruction,
     };
 
     pub fn write(self: Codec, allocator: std.mem.Allocator, stream: transport.Stream, instr: ProxyInstruction) !void {
@@ -29,36 +29,16 @@ pub const JsonCodec = struct {
     }
 
     fn write(_: *anyopaque, allocator: std.mem.Allocator, stream: transport.Stream, instr: ProxyInstruction) anyerror!void {
-        var list = std.ArrayList(u8).init(allocator);
-        defer list.deinit();
-
-        const json_val = try instruction_to_json(allocator, instr);
-        defer json_val.deinit();
-
-        try std.json.stringify(json_val, .{}, list.writer());
-        const payload = list.items;
-
-        var len_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(payload.len)), .big);
-        try stream.write(&len_buf);
-        if (payload.len > 0) {
-            try stream.write(payload);
-        }
+        _ = allocator;
+        _ = stream;
+        _ = instr;
+        return error.UnsupportedCodec;
     }
 
     fn read(_: *anyopaque, allocator: std.mem.Allocator, stream: transport.Stream) anyerror!ProxyInstruction {
-        var len_buf: [4]u8 = undefined;
-        try read_exact(stream, &len_buf);
-        const len = std.mem.readInt(u32, &len_buf, .big);
-        const payload = try allocator.alloc(u8, len);
-        defer allocator.free(payload);
-        if (len > 0) {
-            try read_exact(stream, payload);
-        }
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
-        defer parsed.deinit();
-        return instruction_from_json(allocator, parsed.value);
+        _ = allocator;
+        _ = stream;
+        return error.UnsupportedCodec;
     }
 
     fn read_exact(stream: transport.Stream, buf: []u8) !void {
@@ -172,5 +152,6 @@ fn value_from_json(allocator: std.mem.Allocator, value: std.json.Value) !Value {
             }
             break :blk Value{ .map = out[0..idx] };
         },
+        .number_string => |s| Value{ .string = try allocator.dupe(u8, s) },
     };
 }
