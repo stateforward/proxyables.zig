@@ -35,9 +35,9 @@ pub const Proxyable = struct {
 
 const Registry = std.StringHashMapUnmanaged(*const anyopaque);
 
-fn register(registry: *Registry, proxy: anytype) !void {
+fn register(store: *Registry, proxy: anytype) !void {
     const id = proxy_id(proxy);
-    try registry.put(std.heap.page_allocator, id, to_anyopaque(proxy));
+    try store.put(std.heap.page_allocator, id, to_anyopaque(proxy));
 }
 
 fn proxy_id(proxy: anytype) []const u8 {
@@ -61,5 +61,5 @@ fn to_anyopaque(proxy: anytype) *const anyopaque {
     if (@typeInfo(T) != .Pointer) {
         @compileError("Proxyable registry expects proxy pointers.");
     }
-    return @ptrCast(*const anyopaque, proxy);
+    return @ptrCast(proxy);
 }

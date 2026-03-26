@@ -145,7 +145,7 @@ fn deinit_instruction(allocator: std.mem.Allocator, instr: ProxyInstruction) voi
 }
 
 fn execute(ctx: *anyopaque, allocator: std.mem.Allocator, instructions: []const ProxyInstruction) anyerror!cursor_mod.ExecutionResult {
-    const self: *ExportedProxyable = @ptrCast(*ExportedProxyable, ctx);
+    const self: *ExportedProxyable = @ptrCast(@alignCast(ctx));
     const response = try remote.execute_remote(allocator, &self.stream_pool, self.codec, instructions);
     defer deinit_instruction(allocator, response);
     return remote.unwrap_response(allocator, self.executor(), response);

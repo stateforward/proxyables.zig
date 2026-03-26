@@ -37,6 +37,24 @@ pub fn create_throw_instruction(allocator: std.mem.Allocator, err: ProxyError) !
     };
 }
 
+pub fn create_get_instruction(allocator: std.mem.Allocator, key: []const u8) !ProxyInstruction {
+    var list = try allocator.alloc(Value, 1);
+    list[0] = Value{ .string = try allocator.dupe(u8, key) };
+    return create_instruction_unsafe(allocator, .get, Value{ .array = list });
+}
+
+pub fn create_apply_instruction(allocator: std.mem.Allocator, args: []const Value) !ProxyInstruction {
+    var copied = try allocator.alloc(Value, args.len);
+    for (args, 0..) |arg, i| copied[i] = try arg.clone(allocator);
+    return create_instruction_unsafe(allocator, .apply, Value{ .array = copied });
+}
+
+pub fn create_construct_instruction(allocator: std.mem.Allocator, args: []const Value) !ProxyInstruction {
+    var copied = try allocator.alloc(Value, args.len);
+    for (args, 0..) |arg, i| copied[i] = try arg.clone(allocator);
+    return create_instruction_unsafe(allocator, .construct, Value{ .array = copied });
+}
+
 pub fn create_return_instruction(allocator: std.mem.Allocator, value: Value) !ProxyInstruction {
     var value_instr = try create_value_instruction(allocator, value);
     const value_payload = try instruction_to_value(allocator, value_instr);
@@ -45,10 +63,18 @@ pub fn create_return_instruction(allocator: std.mem.Allocator, value: Value) !Pr
     if (value_instr.metadata) |*meta| meta.deinit(allocator);
     return ProxyInstruction{
         .id = try muid.make(allocator),
-        .kind = @intFromEnum(InstructionKind.ret),
+        .kind = @intFromEnum(InstructionKind.@"return"),
         .data = value_payload,
         .metadata = null,
     };
+}
+
+pub fn create_execute_instruction(allocator: std.mem.Allocator, instructions: []const ProxyInstruction) !ProxyInstruction {
+    var list = try allocator.alloc(Value, instructions.len);
+    for (instructions, 0..) |instr, i| {
+        list[i] = try instruction_to_value(allocator, instr);
+    }
+    return create_instruction_unsafe(allocator, .execute, Value{ .array = list });
 }
 
 pub fn create_release_instruction(allocator: std.mem.Allocator, ref_id: []const u8) !ProxyInstruction {
@@ -63,7 +89,10 @@ pub fn create_release_instruction(allocator: std.mem.Allocator, ref_id: []const 
 }
 
 pub fn instruction_to_value(allocator: std.mem.Allocator, instr: ProxyInstruction) !Value {
-    var entries = try allocator.alloc(types.MapEntry, 4);
+    const entry_count: usize = 2 +
+        @as(usize, @intFromBool(instr.id != null)) +
+        @as(usize, @intFromBool(instr.metadata != null));
+    var entries = try allocator.alloc(types.MapEntry, entry_count);
     var count: usize = 0;
 
     if (instr.id) |id| {
@@ -89,4 +118,56 @@ pub fn proxy_error_to_value(allocator: std.mem.Allocator, err: ProxyError) !Valu
         entries[1] = .{ .key = try allocator.dupe(u8, "cause"), .value = try proxy_error_to_value(allocator, cause.*) };
     }
     return Value{ .map = entries };
+}
+
+test "dsl constants match shared contract" {
+    try std.testing.expectEqual(@as(u32, 0x5a1b3c4d), @intFromEnum(ValueKind.reference));
+    try std.testing.expectEqual(@as(u32, 0xa01e3d98), @intFromEnum(InstructionKind.execute));
+    try std.testing.expectEqual(@as(u32, 0x1a2b3c4d), @intFromEnum(InstructionKind.release));
+}
+
+test "dsl instruction shapes are canonical" {
+    const allocator = std.testing.allocator;
+
+    var get = try create_get_instruction(allocator, "key");
+    defer {
+        if (get.id) |id| allocator.free(id);
+        get.data.deinit(allocator);
+    }
+    try std.testing.expectEqual(@intFromEnum(InstructionKind.get), get.kind);
+
+    const args = [_]Value{ Value{ .int = 1 }, Value{ .int = 2 } };
+    var apply = try create_apply_instruction(allocator, &args);
+    defer {
+        if (apply.id) |id| allocator.free(id);
+        apply.data.deinit(allocator);
+    }
+    try std.testing.expectEqual(@intFromEnum(InstructionKind.apply), apply.kind);
+
+    var construct = try create_construct_instruction(allocator, &args);
+    defer {
+        if (construct.id) |id| allocator.free(id);
+        construct.data.deinit(allocator);
+    }
+    try std.testing.expectEqual(@intFromEnum(InstructionKind.construct), construct.kind);
+
+    var release = try create_release_instruction(allocator, "ref-1");
+    defer {
+        if (release.id) |id| allocator.free(id);
+        release.data.deinit(allocator);
+    }
+    try std.testing.expectEqual(@intFromEnum(InstructionKind.release), release.kind);
+
+    const execute_fixture = ProxyInstruction{
+        .id = null,
+        .kind = @intFromEnum(InstructionKind.get),
+        .data = .null,
+        .metadata = null,
+    };
+    var exec = try create_execute_instruction(allocator, &[_]ProxyInstruction{execute_fixture});
+    defer {
+        if (exec.id) |id| allocator.free(id);
+        exec.data.deinit(allocator);
+    }
+    try std.testing.expectEqual(@intFromEnum(InstructionKind.execute), exec.kind);
 }

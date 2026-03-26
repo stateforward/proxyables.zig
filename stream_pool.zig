@@ -93,7 +93,7 @@ pub const StreamPool = struct {
             return;
         }
         self.shutdown = true;
-        var idle = self.idle.toOwnedSlice() catch |err| {
+        const idle = self.idle.toOwnedSlice() catch |err| {
             _ = err;
             self.idle.clearRetainingCapacity();
             self.mutex.unlock();

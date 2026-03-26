@@ -108,9 +108,9 @@ fn map_get(map: []MapEntry, key: []const u8) ?Value {
 fn parse_u32(allocator: std.mem.Allocator, value: Value) !u32 {
     _ = allocator;
     return switch (value) {
-        .uint => |u| @intCast(u32, u),
-        .int => |i| @intCast(u32, i),
-        .float => |f| @intCast(u32, @intFromFloat(i64, f)),
+        .uint => |u| std.math.cast(u32, u) orelse return error.InvalidKind,
+        .int => |i| std.math.cast(u32, i) orelse return error.InvalidKind,
+        .float => |f| std.math.cast(u32, @as(i64, @intFromFloat(f))) orelse return error.InvalidKind,
         .string => |s| blk: {
             const parsed = try std.fmt.parseInt(u32, s, 10);
             break :blk parsed;

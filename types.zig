@@ -23,7 +23,7 @@ pub const InstructionKind = enum(u32) {
     construct = 0x40c09172,
     execute = 0xa01e3d98,
     throw = 0x7a78762f,
-    ret = 0x85ee37bf,
+    @"return" = 0x85ee37bf,
     next = 0x5cb68de8,
     release = 0x1a2b3c4d,
 };

@@ -26,7 +26,7 @@ pub fn make(allocator: std.mem.Allocator) ![]const u8 {
         state.initialized = true;
     }
 
-    var now_ms: u64 = @intCast(u64, std.time.milliTimestamp());
+    var now_ms: u64 = @intCast(std.time.milliTimestamp());
     if (now_ms < EPOCH) now_ms = EPOCH;
     var current_timestamp = now_ms - EPOCH;
 
@@ -39,7 +39,7 @@ pub fn make(allocator: std.mem.Allocator) ![]const u8 {
         if (state.counter == 0) {
             // Wait for next millisecond
             while (current_timestamp == state.last_timestamp) {
-                now_ms = @intCast(u64, std.time.milliTimestamp());
+                now_ms = @intCast(std.time.milliTimestamp());
                 if (now_ms < EPOCH) now_ms = EPOCH;
                 current_timestamp = now_ms - EPOCH;
             }
@@ -58,16 +58,16 @@ pub fn make(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn init_machine_id() u64 {
-    var buf: [256]u8 = undefined;
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     var hostname: []const u8 = "";
-    if (std.os.gethostname(&buf)) |len| {
-        hostname = buf[0..len];
+    if (std.posix.gethostname(&buf)) |name| {
+        hostname = name;
     } else |_| {
         hostname = "";
     }
 
     if (hostname.len == 0) {
-        var rng = std.rand.DefaultPrng.init(@intCast(u64, std.time.nanoTimestamp()));
+        var rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
         return rng.random().int(u64) & MAX_MACHINE_ID;
     }
 
@@ -84,7 +84,7 @@ fn to_base32(allocator: std.mem.Allocator, num: u64) ![]const u8 {
     var i: usize = 0;
     var n = num;
     while (n > 0) : (n /= 32) {
-        buf[i] = alphabet[@intCast(usize, n % 32)];
+        buf[i] = alphabet[@as(usize, @intCast(n % 32))];
         i += 1;
     }
 

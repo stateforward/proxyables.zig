@@ -60,21 +60,21 @@ pub const SingleSession = struct {
     }
 
     fn open(ctx: *anyopaque) anyerror!Stream {
-        const self: *SingleSession = @ptrCast(*SingleSession, ctx);
+        const self: *SingleSession = @ptrCast(@alignCast(ctx));
         if (self.used_open) return error.StreamUnavailable;
         self.used_open = true;
         return self.stream;
     }
 
     fn accept(ctx: *anyopaque) anyerror!Stream {
-        const self: *SingleSession = @ptrCast(*SingleSession, ctx);
+        const self: *SingleSession = @ptrCast(@alignCast(ctx));
         if (self.used_accept) return error.StreamUnavailable;
         self.used_accept = true;
         return self.stream;
     }
 
     fn close(ctx: *anyopaque) void {
-        const self: *SingleSession = @ptrCast(*SingleSession, ctx);
+        const self: *SingleSession = @ptrCast(@alignCast(ctx));
         self.stream.close();
     }
 

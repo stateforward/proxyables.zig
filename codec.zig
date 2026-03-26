@@ -39,7 +39,7 @@ pub const JsonCodec = struct {
         const payload = list.items;
 
         var len_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len_buf, @intCast(u32, payload.len), .big);
+        std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(payload.len)), .big);
         try stream.write(&len_buf);
         if (payload.len > 0) {
             try stream.write(payload);
@@ -50,7 +50,7 @@ pub const JsonCodec = struct {
         var len_buf: [4]u8 = undefined;
         try read_exact(stream, &len_buf);
         const len = std.mem.readInt(u32, &len_buf, .big);
-        var payload = try allocator.alloc(u8, len);
+        const payload = try allocator.alloc(u8, len);
         defer allocator.free(payload);
         if (len > 0) {
             try read_exact(stream, payload);
@@ -78,7 +78,7 @@ fn instruction_to_json(allocator: std.mem.Allocator, instr: ProxyInstruction) !s
     if (instr.id) |id| {
         try object.put("id", std.json.Value{ .string = try allocator.dupe(u8, id) });
     }
-    try object.put("kind", std.json.Value{ .integer = @intCast(i64, instr.kind) });
+    try object.put("kind", std.json.Value{ .integer = @as(i64, instr.kind) });
     try object.put("data", try value_to_json(allocator, instr.data));
     if (instr.metadata) |meta| {
         try object.put("metadata", try value_to_json(allocator, meta));
@@ -97,8 +97,8 @@ fn instruction_from_json(allocator: std.mem.Allocator, value: std.json.Value) !P
 
     if (obj.get("kind")) |k| {
         switch (k) {
-            .integer => |i| kind_val = @intCast(u32, i),
-            .float => |f| kind_val = @intCast(u32, @intFromFloat(i64, f)),
+            .integer => |i| kind_val = std.math.cast(u32, i),
+            .float => |f| kind_val = std.math.cast(u32, @as(i64, @intFromFloat(f))),
             else => {},
         }
     }
@@ -127,7 +127,7 @@ fn value_to_json(allocator: std.mem.Allocator, value: Value) !std.json.Value {
         .null, .undefined => std.json.Value{ .null = {} },
         .boolean => |b| std.json.Value{ .bool = b },
         .int => |i| std.json.Value{ .integer = i },
-        .uint => |u| std.json.Value{ .integer = @intCast(i64, u) },
+        .uint => |u| std.json.Value{ .integer = std.math.lossyCast(i64, u) },
         .float => |f| std.json.Value{ .float = f },
         .string => |s| std.json.Value{ .string = try allocator.dupe(u8, s) },
         .binary => |b| blk: {

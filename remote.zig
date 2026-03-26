@@ -28,7 +28,7 @@ pub fn execute_remote(
 
     const exec_instr = try instructions_mod.create_instruction_unsafe(arena.allocator(), .execute, Value{ .array = serialized });
 
-    var stream = try pool.acquire();
+    const stream = try pool.acquire();
     defer pool.release(stream);
 
     try codec.write(arena.allocator(), stream, exec_instr);
@@ -46,8 +46,8 @@ pub fn unwrap_response(
             const err = helpers.parse_proxy_error(allocator, response.data);
             return .{ .err = err };
         },
-        .ret => {
-            const value_instr = helpers.parse_instruction_value(allocator, response.data) catch |err| {
+        .@"return" => {
+            const value_instr = helpers.parse_instruction_value(allocator, response.data) catch {
                 return .{ .err = ProxyError{ .message = "invalid return value" } };
             };
             if (value_instr.kind == @intFromEnum(ValueKind.reference)) {

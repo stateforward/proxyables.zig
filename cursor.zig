@@ -46,7 +46,7 @@ pub const ProxyCursor = struct {
     }
 
     pub fn get(self: ProxyCursor, key: []const u8) !ProxyCursor {
-        var key_val = Value{ .string = try self.allocator.dupe(u8, key) };
+        const key_val = Value{ .string = try self.allocator.dupe(u8, key) };
         var args = try self.allocator.alloc(Value, 1);
         args[0] = key_val;
         const instr = try instructions_mod.create_instruction_unsafe(self.allocator, .get, Value{ .array = args });

@@ -146,7 +146,7 @@ fn default_codec(allocator: std.mem.Allocator) codec_mod.Codec {
 }
 
 fn execute(ctx: *anyopaque, allocator: std.mem.Allocator, instructions: []const ProxyInstruction) anyerror!cursor_mod.ExecutionResult {
-    const self: *ImportedProxyable = @ptrCast(*ImportedProxyable, ctx);
+    const self: *ImportedProxyable = @ptrCast(@alignCast(ctx));
     const response = try remote.execute_remote(allocator, &self.stream_pool, self.codec, instructions);
     defer deinit_instruction(allocator, response);
     return remote.unwrap_response(allocator, self.executor(), response);
