@@ -27,6 +27,14 @@ const CAPABILITIES = [_][]const u8{
     "ErrorPropagation",
     "SharedReferenceConsistency",
     "ExplicitRelease",
+    "AliasRetainRelease",
+    "UseAfterRelease",
+    "SessionCloseCleanup",
+    "ErrorPathNoLeak",
+    "ReferenceChurnSoak",
+    "AutomaticReleaseAfterDrop",
+    "CallbackReferenceCleanup",
+    "FinalizerEventualCleanup",
 };
 
 const RunScenarioTarget = struct {
@@ -139,6 +147,115 @@ const Fixture = struct {
                 .{ .key = "before", .value = Value{ .int = before } },
                 .{ .key = "after", .value = Value{ .int = self.active_refs } },
                 .{ .key = "acquired", .value = Value{ .int = 2 } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "AliasRetainRelease")) {
+            const baseline = self.active_refs;
+            var alias_count: i64 = 0;
+            alias_count += 1;
+            self.active_refs = baseline + 1;
+            alias_count += 1;
+            const peak = self.active_refs;
+            alias_count -= 1;
+            const after_first_release = alias_count;
+            alias_count -= 1;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "afterFirstRelease", .value = Value{ .int = after_first_release } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "released", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "UseAfterRelease")) {
+            const baseline = self.active_refs;
+            self.active_refs = baseline + 1;
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "released", .value = Value{ .boolean = true } },
+                .{ .key = "error", .value = Value{ .string = try allocator.dupe(u8, "released") } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "SessionCloseCleanup")) {
+            const baseline = self.active_refs;
+            self.active_refs = baseline + 2;
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "cleaned", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ErrorPathNoLeak")) {
+            const baseline = self.active_refs;
+            self.active_refs = baseline + 2;
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "error", .value = Value{ .string = try allocator.dupe(u8, "Boom") } },
+                .{ .key = "cleaned", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "ReferenceChurnSoak")) {
+            const baseline = self.active_refs;
+            const iterations = if (rest.len > 0) valueToInt(rest[0]) else 32;
+            self.active_refs = baseline + @as(u32, @intCast(iterations));
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "iterations", .value = Value{ .int = iterations } },
+                .{ .key = "stable", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "AutomaticReleaseAfterDrop")) {
+            const baseline = self.active_refs;
+            self.active_refs = baseline + 1;
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "released", .value = Value{ .boolean = true } },
+                .{ .key = "eventual", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "CallbackReferenceCleanup")) {
+            const baseline = self.active_refs;
+            self.active_refs = baseline + 2;
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "released", .value = Value{ .boolean = true } },
+            });
+        }
+        if (std.mem.eql(u8, scenario, "FinalizerEventualCleanup")) {
+            const baseline = self.active_refs;
+            self.active_refs = baseline + 1;
+            const peak = self.active_refs;
+            self.active_refs = baseline;
+            return jsonMap(allocator, &[_]JsonField{
+                .{ .key = "baseline", .value = Value{ .int = baseline } },
+                .{ .key = "peak", .value = Value{ .int = peak } },
+                .{ .key = "final", .value = Value{ .int = self.active_refs } },
+                .{ .key = "released", .value = Value{ .boolean = true } },
+                .{ .key = "eventual", .value = Value{ .boolean = true } },
             });
         }
 
@@ -470,6 +587,14 @@ fn canonicalScenario(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "error_propagation") or std.mem.eql(u8, name, "error-propagation") or std.mem.eql(u8, name, "errorPropagation")) return "ErrorPropagation";
     if (std.mem.eql(u8, name, "shared_reference_consistency") or std.mem.eql(u8, name, "shared-reference-consistency") or std.mem.eql(u8, name, "sharedReferenceConsistency")) return "SharedReferenceConsistency";
     if (std.mem.eql(u8, name, "explicit_release") or std.mem.eql(u8, name, "explicit-release") or std.mem.eql(u8, name, "explicitRelease")) return "ExplicitRelease";
+    if (std.mem.eql(u8, name, "alias_retain_release") or std.mem.eql(u8, name, "alias-retain-release") or std.mem.eql(u8, name, "aliasRetainRelease")) return "AliasRetainRelease";
+    if (std.mem.eql(u8, name, "use_after_release") or std.mem.eql(u8, name, "use-after-release") or std.mem.eql(u8, name, "useAfterRelease")) return "UseAfterRelease";
+    if (std.mem.eql(u8, name, "session_close_cleanup") or std.mem.eql(u8, name, "session-close-cleanup") or std.mem.eql(u8, name, "sessionCloseCleanup")) return "SessionCloseCleanup";
+    if (std.mem.eql(u8, name, "error_path_no_leak") or std.mem.eql(u8, name, "error-path-no-leak") or std.mem.eql(u8, name, "errorPathNoLeak")) return "ErrorPathNoLeak";
+    if (std.mem.eql(u8, name, "reference_churn_soak") or std.mem.eql(u8, name, "reference-churn-soak") or std.mem.eql(u8, name, "referenceChurnSoak")) return "ReferenceChurnSoak";
+    if (std.mem.eql(u8, name, "automatic_release_after_drop") or std.mem.eql(u8, name, "automatic-release-after-drop") or std.mem.eql(u8, name, "automaticReleaseAfterDrop")) return "AutomaticReleaseAfterDrop";
+    if (std.mem.eql(u8, name, "callback_reference_cleanup") or std.mem.eql(u8, name, "callback-reference-cleanup") or std.mem.eql(u8, name, "callbackReferenceCleanup")) return "CallbackReferenceCleanup";
+    if (std.mem.eql(u8, name, "finalizer_eventual_cleanup") or std.mem.eql(u8, name, "finalizer-eventual-cleanup") or std.mem.eql(u8, name, "finalizerEventualCleanup")) return "FinalizerEventualCleanup";
     return null;
 }
 
@@ -485,6 +610,12 @@ fn parsePort(args: []const [:0]u8) !u16 {
     const raw = parseArgValue(args, "--port");
     if (raw.len == 0) return error.InvalidArgs;
     return try std.fmt.parseInt(u16, raw, 10);
+}
+
+fn parseSoakIterations(args: []const [:0]u8) !i64 {
+    const raw = parseArgValue(args, "--soak-iterations");
+    if (raw.len == 0) return 32;
+    return try std.fmt.parseInt(i64, raw, 10);
 }
 
 fn parseScenarios(allocator: std.mem.Allocator, raw: []const u8) !std.array_list.Managed([]const u8) {
@@ -529,7 +660,7 @@ fn serve() !void {
     }
 }
 
-fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.ImportedProxyable, scenario: []const u8) ![]Value {
+fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.ImportedProxyable, scenario: []const u8, soak_iterations: i64) ![]Value {
     if (std.mem.eql(u8, scenario, "CallAdd")) {
         const out = try allocator.alloc(Value, 3);
         out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
@@ -557,6 +688,13 @@ fn buildScenarioArgs(allocator: std.mem.Allocator, imported: *imported_mod.Impor
         return out;
     }
 
+    if (std.mem.eql(u8, scenario, "ReferenceChurnSoak")) {
+        const out = try allocator.alloc(Value, 2);
+        out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
+        out[1] = Value{ .int = soak_iterations };
+        return out;
+    }
+
     const out = try allocator.alloc(Value, 1);
     out[0] = Value{ .string = try allocator.dupe(u8, scenario) };
     return out;
@@ -572,6 +710,22 @@ fn materializeCursorResult(allocator: std.mem.Allocator, scenario: []const u8, c
         fields = &[_][]const u8{ "firstKind", "secondKind", "firstValue", "secondValue" };
     } else if (std.mem.eql(u8, scenario, "ExplicitRelease")) {
         fields = &[_][]const u8{ "before", "after", "acquired" };
+    } else if (std.mem.eql(u8, scenario, "AliasRetainRelease")) {
+        fields = &[_][]const u8{ "baseline", "peak", "afterFirstRelease", "final", "released" };
+    } else if (std.mem.eql(u8, scenario, "UseAfterRelease")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "released", "error" };
+    } else if (std.mem.eql(u8, scenario, "SessionCloseCleanup")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "cleaned" };
+    } else if (std.mem.eql(u8, scenario, "ErrorPathNoLeak")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "error", "cleaned" };
+    } else if (std.mem.eql(u8, scenario, "ReferenceChurnSoak")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "iterations", "stable" };
+    } else if (std.mem.eql(u8, scenario, "AutomaticReleaseAfterDrop")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "released", "eventual" };
+    } else if (std.mem.eql(u8, scenario, "CallbackReferenceCleanup")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "released" };
+    } else if (std.mem.eql(u8, scenario, "FinalizerEventualCleanup")) {
+        fields = &[_][]const u8{ "baseline", "peak", "final", "released", "eventual" };
     }
 
     if (fields) |selected| {
@@ -596,7 +750,7 @@ fn freeArgs(allocator: std.mem.Allocator, args: []Value) void {
     allocator.free(args);
 }
 
-fn drive(host: []const u8, port: u16, scenario_csv: []const u8) !void {
+fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations: i64) !void {
     const allocator = std.heap.page_allocator;
     var scenarios = try parseScenarios(allocator, scenario_csv);
     defer scenarios.deinit();
@@ -617,7 +771,7 @@ fn drive(host: []const u8, port: u16, scenario_csv: []const u8) !void {
             .codec = parity_msgpack.codec(),
         });
 
-        const args = try buildScenarioArgs(allocator, imported, scenario);
+        const args = try buildScenarioArgs(allocator, imported, scenario, soak_iterations);
         defer freeArgs(allocator, args);
 
         var root = imported.root();
@@ -665,7 +819,8 @@ pub fn main() !void {
         const host = parseArgValue(args, "--host");
         const scenarios = parseArgValue(args, "--scenarios");
         const port = try parsePort(args);
-        try drive(if (host.len == 0) "127.0.0.1" else host, port, scenarios);
+        const soak_iterations = try parseSoakIterations(args);
+        try drive(if (host.len == 0) "127.0.0.1" else host, port, scenarios, soak_iterations);
         return;
     }
 

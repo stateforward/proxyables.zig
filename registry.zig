@@ -42,6 +42,11 @@ pub const ObjectRegistry = struct {
         count: usize,
     };
 
+    pub const Snapshot = struct {
+        entries: usize,
+        retains: usize,
+    };
+
     pub fn init(allocator: std.mem.Allocator) ObjectRegistry {
         return .{ .allocator = allocator };
     }
@@ -105,5 +110,17 @@ pub const ObjectRegistry = struct {
             _ = self.entries.remove(id);
             self.allocator.free(id);
         }
+    }
+
+    pub fn snapshot(self: *ObjectRegistry) Snapshot {
+        var retains: usize = 0;
+        var iterator = self.entries.iterator();
+        while (iterator.next()) |entry| {
+            retains += entry.value_ptr.count;
+        }
+        return .{
+            .entries = self.entries.count(),
+            .retains = retains,
+        };
     }
 };
