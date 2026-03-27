@@ -884,6 +884,18 @@ fn parseConcurrency(args: []const [:0]u8) !i64 {
     return try std.fmt.parseInt(i64, raw, 10);
 }
 
+fn parseIterations(args: []const [:0]u8) !usize {
+    const raw = parseArgValue(args, "--iterations");
+    if (raw.len == 0) return 1000;
+    return try std.fmt.parseInt(usize, raw, 10);
+}
+
+fn parseWarmup(args: []const [:0]u8) !usize {
+    const raw = parseArgValue(args, "--warmup");
+    if (raw.len == 0) return 100;
+    return try std.fmt.parseInt(usize, raw, 10);
+}
+
 fn parseScenarios(allocator: std.mem.Allocator, raw: []const u8) !std.array_list.Managed([]const u8) {
     var out = std.array_list.Managed([]const u8).init(allocator);
     var iterator = std.mem.splitScalar(u8, raw, ',');
@@ -1126,6 +1138,119 @@ fn staticScenarioActual(allocator: std.mem.Allocator, scenario: []const u8, payl
     return null;
 }
 
+fn runScenarioRequest(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    scenario: []const u8,
+    soak_iterations: i64,
+    payload_bytes: i64,
+    concurrency: i64,
+    allow_static: bool,
+) !Value {
+    if (allow_static) {
+        if (try staticScenarioActual(allocator, scenario, payload_bytes, concurrency)) |actual| {
+            return actual;
+        }
+    }
+
+    const address = try std.net.Address.parseIp4(host, port);
+    const conn = try std.net.tcpConnectToAddress(address);
+    const session_adapter = try parity_yamux.SessionAdapter.init(allocator, conn, true);
+    const imported = try imported_mod.create_imported_proxyable(.{
+        .allocator = allocator,
+        .session = session_adapter.session(),
+        .codec = parity_msgpack.codec(),
+    });
+
+    const args = try buildScenarioArgs(allocator, imported, scenario, soak_iterations, payload_bytes, concurrency);
+    defer freeArgs(allocator, args);
+
+    var root = imported.root();
+    defer root.deinit();
+    var method = try root.get("RunScenario");
+    defer method.deinit();
+    var call = try method.apply(args);
+    defer call.deinit();
+    const result = try call.exec();
+
+    if (result.err) |_| {
+        return error.RemoteFailure;
+    }
+    if (result.value) |value| {
+        return try value.clone(allocator);
+    }
+    if (result.cursor) |cursor| {
+        defer {
+            var mutable = cursor;
+            mutable.deinit();
+        }
+        if (try materializeCursorResult(allocator, scenario, cursor)) |value| {
+            return value;
+        }
+    }
+    return error.MissingResult;
+}
+
+fn benchmarkLessThan(_: void, left: f64, right: f64) bool {
+    return left < right;
+}
+
+fn emitBenchmark(
+    allocator: std.mem.Allocator,
+    scenario: []const u8,
+    status: []const u8,
+    iterations: usize,
+    warmup: usize,
+    samples: []const f64,
+    message: ?[]const u8,
+) !void {
+    var buffer = std.array_list.Managed(u8).init(allocator);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    try writer.writeAll("{\"type\":\"benchmark\",\"scenario\":");
+    try writeJsonString(writer, scenario);
+    try writer.writeAll(",\"status\":");
+    try writeJsonString(writer, status);
+    try writer.writeAll(",\"protocol\":");
+    try writeJsonString(writer, PROTOCOL);
+
+    if (std.mem.eql(u8, status, "passed")) {
+        var total_ms: f64 = 0.0;
+        for (samples) |sample| total_ms += sample;
+
+        const ordered = try allocator.alloc(f64, samples.len);
+        defer allocator.free(ordered);
+        @memcpy(ordered, samples);
+        std.sort.heap(f64, ordered, {}, benchmarkLessThan);
+
+        const count_f = @as(f64, @floatFromInt(ordered.len));
+        const avg_ms = if (ordered.len == 0) 0.0 else total_ms / count_f;
+        const ops = if (total_ms > 0) (count_f * 1000.0) / total_ms else 0.0;
+        const p50_index = if (ordered.len == 0) 0 else @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(ordered.len - 1)) * 0.50)));
+        const p95_index = if (ordered.len == 0) 0 else @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(ordered.len - 1)) * 0.95)));
+
+        try writer.print(",\"iterations\":{d},\"warmup\":{d},\"metrics\":{{\"totalMs\":{d},\"avgMs\":{d},\"ops\":{d},\"p50Ms\":{d},\"p95Ms\":{d},\"minMs\":{d},\"maxMs\":{d}}}", .{
+            iterations,
+            warmup,
+            total_ms,
+            avg_ms,
+            ops,
+            if (ordered.len == 0) 0.0 else ordered[p50_index],
+            if (ordered.len == 0) 0.0 else ordered[p95_index],
+            if (ordered.len == 0) 0.0 else ordered[0],
+            if (ordered.len == 0) 0.0 else ordered[ordered.len - 1],
+        });
+    }
+
+    if (message) |text| {
+        try writer.writeAll(",\"message\":");
+        try writeJsonString(writer, text);
+    }
+    try writer.writeAll("}");
+    try emitLine(buffer.items);
+}
+
 fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations: i64, payload_bytes: i64, concurrency: i64) !void {
     const allocator = std.heap.page_allocator;
     var scenarios = try parseScenarios(allocator, scenario_csv);
@@ -1137,50 +1262,57 @@ fn drive(host: []const u8, port: u16, scenario_csv: []const u8, soak_iterations:
             try emitScenario(scenario_name, "unsupported", null, "unsupported");
             continue;
         }
-        if (try staticScenarioActual(allocator, scenario, payload_bytes, concurrency)) |actual| {
-            try emitScenario(scenario, "passed", actual, null);
+        const actual = runScenarioRequest(allocator, host, port, scenario, soak_iterations, payload_bytes, concurrency, true) catch |err| {
+            try emitScenario(scenario, "failed", null, @errorName(err));
+            continue;
+        };
+        try emitScenario(scenario, "passed", actual, null);
+    }
+}
+
+fn bench(host: []const u8, port: u16, scenario_csv: []const u8, iterations: usize, warmup: usize, payload_bytes: i64) !void {
+    const allocator = std.heap.page_allocator;
+    var scenarios = try parseScenarios(allocator, scenario_csv);
+    defer scenarios.deinit();
+
+    for (scenarios.items) |scenario_name| {
+        const scenario = canonicalScenario(scenario_name) orelse scenario_name;
+        if (canonicalScenario(scenario_name) == null) {
+            try emitBenchmark(allocator, scenario_name, "unsupported", iterations, warmup, &.{}, "unsupported");
             continue;
         }
 
-        const address = try std.net.Address.parseIp4(host, port);
-        const conn = try std.net.tcpConnectToAddress(address);
-        const session_adapter = try parity_yamux.SessionAdapter.init(allocator, conn, true);
-        const imported = try imported_mod.create_imported_proxyable(.{
-            .allocator = allocator,
-            .session = session_adapter.session(),
-            .codec = parity_msgpack.codec(),
-        });
-
-        const args = try buildScenarioArgs(allocator, imported, scenario, soak_iterations, payload_bytes, concurrency);
-        defer freeArgs(allocator, args);
-
-        var root = imported.root();
-        defer root.deinit();
-        var method = try root.get("RunScenario");
-        defer method.deinit();
-        var call = try method.apply(args);
-        defer call.deinit();
-        const result = try call.exec();
-
-        if (result.err) |proxy_error| {
-            try emitScenario(scenario, "failed", null, proxy_error.message);
-            continue;
+        var failed_message: ?[]const u8 = null;
+        var warmup_index: usize = 0;
+        while (warmup_index < warmup) : (warmup_index += 1) {
+            var actual = runScenarioRequest(allocator, host, port, scenario, 32, payload_bytes, 8, false) catch |err| {
+                failed_message = @errorName(err);
+                break;
+            };
+            actual.deinit(allocator);
         }
-        if (result.value) |value| {
-            try emitScenario(scenario, "passed", value, null);
-            continue;
-        }
-        if (result.cursor) |cursor| {
-            defer {
-                var mutable = cursor;
-                mutable.deinit();
+
+        var samples = try allocator.alloc(f64, iterations);
+        defer allocator.free(samples);
+        var sample_count: usize = 0;
+        if (failed_message == null) {
+            while (sample_count < iterations) : (sample_count += 1) {
+                const start = std.time.nanoTimestamp();
+                var actual = runScenarioRequest(allocator, host, port, scenario, 32, payload_bytes, 8, false) catch |err| {
+                    failed_message = @errorName(err);
+                    break;
+                };
+                const elapsed_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start)) / @as(f64, std.time.ns_per_ms);
+                actual.deinit(allocator);
+                samples[sample_count] = elapsed_ms;
             }
-            if (try materializeCursorResult(allocator, scenario, cursor)) |value| {
-                try emitScenario(scenario, "passed", value, null);
-                continue;
-            }
         }
-        try emitScenario(scenario, "failed", null, "missing result");
+
+        if (failed_message) |message| {
+            try emitBenchmark(allocator, scenario, "failed", iterations, warmup, samples[0..sample_count], message);
+            continue;
+        }
+        try emitBenchmark(allocator, scenario, "passed", iterations, warmup, samples[0..sample_count], null);
     }
 }
 
@@ -1203,6 +1335,17 @@ pub fn main() !void {
         const payload_bytes = try parsePayloadBytes(args);
         const concurrency = try parseConcurrency(args);
         try drive(if (host.len == 0) "127.0.0.1" else host, port, scenarios, soak_iterations, payload_bytes, concurrency);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "bench")) {
+        const host = parseArgValue(args, "--host");
+        const scenarios = parseArgValue(args, "--scenarios");
+        const port = try parsePort(args);
+        const iterations = try parseIterations(args);
+        const warmup = try parseWarmup(args);
+        const payload_bytes = try parsePayloadBytes(args);
+        try bench(if (host.len == 0) "127.0.0.1" else host, port, scenarios, iterations, warmup, payload_bytes);
         return;
     }
 
